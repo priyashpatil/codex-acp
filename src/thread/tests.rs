@@ -1220,7 +1220,7 @@ async fn test_plan_completion_prompts_and_accept_submits_default_mode_implementa
             ),
             (
                 PLAN_IMPLEMENTATION_STAY_OPTION_ID.to_string(),
-                "Reject and continue planning",
+                "Reject and wait for my message",
                 PermissionOptionKind::RejectOnce,
             ),
         ]
@@ -1384,8 +1384,8 @@ async fn test_plan_completion_stay_in_plan_does_not_submit_implementation() -> a
         SessionUpdate::ToolCallUpdate(ToolCallUpdate {
             fields,
             ..
-        }) if fields.status == Some(ToolCallStatus::Failed)
-            && fields.title.as_deref() == Some("Plan rejected")
+        }) if fields.status == Some(ToolCallStatus::Completed)
+            && fields.title.as_deref() == Some("Waiting for user response")
             && matches!(
                 fields.content.as_deref(),
                 Some([
@@ -1406,6 +1406,43 @@ async fn test_plan_completion_stay_in_plan_does_not_submit_implementation() -> a
         )),
         "rejected plan should stay in the tool-call UI, not be pasted into chat"
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_plan_updates_do_not_regress_after_context_compaction() -> anyhow::Result<()> {
+    let (session_id, client, _conversation, _message_tx, _handle) = setup().await?;
+
+    let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+    _message_tx.send(ThreadMessage::Prompt {
+        request: PromptRequest::new(session_id, vec!["plan-update-after-compact".into()]),
+        response_tx,
+    })?;
+    response_rx.await??.await??;
+
+    let notifications = client.notifications.lock().unwrap();
+    let plans = notifications
+        .iter()
+        .filter_map(|notification| match &notification.update {
+            SessionUpdate::Plan(plan) => Some(plan),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        plans.len(),
+        2,
+        "empty plan update should not clear the ACP plan: {plans:?}"
+    );
+    let final_entries = &plans.last().unwrap().entries;
+    assert_eq!(final_entries.len(), 3);
+    assert_eq!(final_entries[0].content, "Inspect current plan handling");
+    assert_eq!(final_entries[0].status, PlanEntryStatus::Completed);
+    assert_eq!(final_entries[1].content, "Patch compaction handling");
+    assert_eq!(final_entries[1].status, PlanEntryStatus::InProgress);
+    assert_eq!(final_entries[2].content, "Run tests");
+    assert_eq!(final_entries[2].status, PlanEntryStatus::Pending);
 
     Ok(())
 }
@@ -1756,6 +1793,80 @@ impl CodexThreadImpl for StubCodexThread {
                                 }),
                             })
                             .unwrap();
+                    } else if prompt == "plan-update-after-compact" {
+                        let turn_id = id.to_string();
+                        let thread_id = codex_protocol::ThreadId::new();
+                        let compact_item = codex_protocol::items::ContextCompactionItem::new();
+                        let send = |msg| {
+                            self.op_tx
+                                .send(Event {
+                                    id: id.to_string(),
+                                    msg,
+                                })
+                                .unwrap();
+                        };
+
+                        send(EventMsg::TurnStarted(TurnStartedEvent {
+                            model_context_window: None,
+                            collaboration_mode_kind: ModeKind::Default,
+                            turn_id: turn_id.clone(),
+                            started_at: None,
+                        }));
+                        send(EventMsg::PlanUpdate(UpdatePlanArgs {
+                            explanation: None,
+                            plan: vec![
+                                PlanItemArg {
+                                    step: "Inspect current plan handling".to_string(),
+                                    status: StepStatus::Completed,
+                                },
+                                PlanItemArg {
+                                    step: "Patch compaction handling".to_string(),
+                                    status: StepStatus::InProgress,
+                                },
+                                PlanItemArg {
+                                    step: "Run tests".to_string(),
+                                    status: StepStatus::Pending,
+                                },
+                            ],
+                        }));
+                        send(EventMsg::ItemStarted(ItemStartedEvent {
+                            thread_id,
+                            turn_id: turn_id.clone(),
+                            item: TurnItem::ContextCompaction(compact_item.clone()),
+                        }));
+                        send(EventMsg::ItemCompleted(ItemCompletedEvent {
+                            thread_id,
+                            turn_id: turn_id.clone(),
+                            item: TurnItem::ContextCompaction(compact_item),
+                        }));
+                        send(EventMsg::PlanUpdate(UpdatePlanArgs {
+                            explanation: None,
+                            plan: Vec::new(),
+                        }));
+                        send(EventMsg::PlanUpdate(UpdatePlanArgs {
+                            explanation: None,
+                            plan: vec![
+                                PlanItemArg {
+                                    step: "Inspect current plan handling".to_string(),
+                                    status: StepStatus::InProgress,
+                                },
+                                PlanItemArg {
+                                    step: "Patch compaction handling".to_string(),
+                                    status: StepStatus::Pending,
+                                },
+                                PlanItemArg {
+                                    step: "Run tests".to_string(),
+                                    status: StepStatus::Pending,
+                                },
+                            ],
+                        }));
+                        send(EventMsg::TurnComplete(TurnCompleteEvent {
+                            last_agent_message: None,
+                            turn_id,
+                            completed_at: None,
+                            duration_ms: None,
+                            time_to_first_token_ms: None,
+                        }));
                     } else if prompt == "subagents" {
                         let turn_id = id.to_string();
                         let sender_thread_id = codex_protocol::ThreadId::new();
@@ -2817,6 +2928,80 @@ async fn test_request_user_input_submits_user_input_answer() -> anyhow::Result<(
                     )
         )
     }));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_request_user_input_reject_interrupts_and_waits_for_message() -> anyhow::Result<()> {
+    let session_id = SessionId::new("test");
+    let client = Arc::new(StubClient::with_permission_responses(vec![
+        RequestPermissionResponse::new(RequestPermissionOutcome::Cancelled),
+    ]));
+    let session_client = SessionClient::with_client(session_id, client.clone(), Arc::default());
+    let thread = Arc::new(StubCodexThread::new());
+    let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+    let (message_tx, mut message_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut prompt_state = PromptState::new(
+        "submission-id".to_string(),
+        thread.clone(),
+        message_tx,
+        response_tx,
+    );
+
+    prompt_state
+        .request_user_input(
+            &session_client,
+            RequestUserInputEvent {
+                call_id: "call-id".to_string(),
+                turn_id: "turn-id".to_string(),
+                questions: vec![RequestUserInputQuestion {
+                    id: "confirm_path".to_string(),
+                    header: "Confirm".to_string(),
+                    question: "Continue?".to_string(),
+                    is_other: false,
+                    is_secret: false,
+                    options: Some(vec![RequestUserInputQuestionOption {
+                        label: "yes".to_string(),
+                        description: "Continue".to_string(),
+                    }]),
+                }],
+            },
+        )
+        .await?;
+
+    let ThreadMessage::PermissionRequestResolved {
+        submission_id,
+        request_key,
+        response,
+    } = message_rx.recv().await.unwrap()
+    else {
+        panic!("expected permission resolution message");
+    };
+    assert_eq!(submission_id, "submission-id");
+
+    prompt_state
+        .handle_permission_request_resolved(&session_client, request_key, response)
+        .await?;
+
+    assert_eq!(response_rx.await??, StopReason::EndTurn);
+    let ops = thread.ops.lock().unwrap();
+    assert_eq!(ops.len(), 1);
+    assert!(matches!(ops.last(), Some(Op::Interrupt)));
+    assert!(
+        !ops.iter()
+            .any(|op| matches!(op, Op::UserInputAnswer { .. })),
+        "rejected questions should not submit empty answers"
+    );
+    drop(ops);
+
+    let notifications = client.notifications.lock().unwrap();
+    assert!(notifications.iter().any(|notification| matches!(
+        &notification.update,
+        SessionUpdate::ToolCallUpdate(ToolCallUpdate { fields, .. })
+            if fields.status == Some(ToolCallStatus::Completed)
+                && fields.title.as_deref() == Some("Waiting for user response")
+    )));
 
     Ok(())
 }

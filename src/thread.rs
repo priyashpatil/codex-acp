@@ -491,6 +491,14 @@ fn context_compaction_status_text(status: ToolCallStatus) -> &'static str {
     }
 }
 
+fn step_status_rank(status: &StepStatus) -> u8 {
+    match status {
+        StepStatus::Pending => 0,
+        StepStatus::InProgress => 1,
+        StepStatus::Completed => 2,
+    }
+}
+
 fn mode_kind_as_id(mode: ModeKind) -> &'static str {
     match mode {
         ModeKind::Plan => "plan",
@@ -759,6 +767,7 @@ struct PromptState {
     turn_collaboration_mode_kind: ModeKind,
     saw_plan_output: bool,
     plan_output_text: Option<String>,
+    last_plan: Vec<PlanItemArg>,
     prompted_for_plan_implementation: bool,
 }
 
@@ -855,6 +864,7 @@ impl PromptState {
             turn_collaboration_mode_kind: ModeKind::Default,
             saw_plan_output: false,
             plan_output_text: None,
+            last_plan: Vec::new(),
             prompted_for_plan_implementation: false,
         }
     }
@@ -950,6 +960,32 @@ impl PromptState {
         }
     }
 
+    fn update_plan(&mut self, client: &SessionClient, plan: Vec<PlanItemArg>) {
+        if plan.is_empty() {
+            debug!("Ignoring empty plan update for active prompt");
+            return;
+        }
+
+        let normalized_plan = plan
+            .into_iter()
+            .map(|mut entry| {
+                if let Some(previous) = self
+                    .last_plan
+                    .iter()
+                    .find(|previous| previous.step == entry.step)
+                    && step_status_rank(&previous.status) > step_status_rank(&entry.status)
+                {
+                    entry.status = previous.status.clone();
+                }
+                entry
+            })
+            .collect::<Vec<_>>();
+
+        self.saw_plan_output = true;
+        self.last_plan = normalized_plan.clone();
+        client.update_plan(normalized_plan);
+    }
+
     fn spawn_permission_request(
         &mut self,
         client: &SessionClient,
@@ -1021,7 +1057,7 @@ impl PromptState {
                 ),
                 PermissionOption::new(
                     PLAN_IMPLEMENTATION_STAY_OPTION_ID,
-                    "Reject and continue planning",
+                    "Reject and wait for my message",
                     PermissionOptionKind::RejectOnce,
                 ),
             ],
@@ -1052,6 +1088,37 @@ impl PromptState {
             call_id,
             ToolCallUpdateFields::new().status(ToolCallStatus::Completed),
         ));
+    }
+
+    async fn cancel_user_input_request(
+        &mut self,
+        client: &SessionClient,
+        call_id: String,
+    ) -> Result<(), Error> {
+        self.thread
+            .submit(Op::Interrupt)
+            .await
+            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+        client.send_tool_call_update(ToolCallUpdate::new(
+            ToolCallId::new(call_id),
+            ToolCallUpdateFields::new()
+                .status(ToolCallStatus::Completed)
+                .title("Waiting for user response")
+                .content(vec![
+                    "Question rejected. Reply in chat to continue."
+                        .to_string()
+                        .into(),
+                ])
+                .raw_output(serde_json::json!({
+                    "decision": "wait_for_user_message",
+                })),
+        ));
+        self.turn_complete = true;
+        self.abort_pending_interactions();
+        if let Some(response_tx) = self.response_tx.take() {
+            response_tx.send(Ok(StopReason::EndTurn)).ok();
+        }
+        Ok(())
     }
 
     fn mark_plan_implementation_decision(
@@ -1341,9 +1408,9 @@ impl PromptState {
                     self.mark_plan_implementation_decision(
                         client,
                         request_key,
-                        ToolCallStatus::Failed,
-                        "Plan rejected",
-                        "stay_in_plan",
+                        ToolCallStatus::Completed,
+                        "Waiting for user response",
+                        "wait_for_user_message",
                     );
                     if let Some(response_tx) = self.response_tx.take() {
                         response_tx.send(Ok(StopReason::EndTurn)).ok();
@@ -1373,8 +1440,7 @@ impl PromptState {
                 };
 
                 let Some(answer) = selected_answer else {
-                    self.finalize_user_input_answers(client, call_id, turn_id, answers)
-                        .await?;
+                    self.cancel_user_input_request(client, call_id).await?;
                     return Ok(());
                 };
 
@@ -1552,10 +1618,7 @@ impl PromptState {
             EventMsg::PlanUpdate(UpdatePlanArgs { explanation, plan }) => {
                 // Send this to the client via session/update notification
                 info!("Agent plan updated. Explanation: {:?}", explanation);
-                if !plan.is_empty() {
-                    self.saw_plan_output = true;
-                }
-                client.update_plan(plan);
+                self.update_plan(client, plan);
             }
             EventMsg::PlanDelta(PlanDeltaEvent {
                 thread_id: _,
