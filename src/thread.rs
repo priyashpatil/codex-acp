@@ -1109,6 +1109,7 @@ struct PromptState {
     active_commands: HashMap<String, ActiveCommand>,
     active_web_searches: HashSet<String>,
     active_context_compactions: HashSet<String>,
+    active_patch_applies: HashSet<String>,
     active_guardian_assessments: HashSet<String>,
     active_subagents_by_call: HashMap<String, ActiveSubagent>,
     active_subagent_calls_by_thread: HashMap<String, ToolCallId>,
@@ -1204,6 +1205,7 @@ impl PromptState {
             active_commands: HashMap::new(),
             active_web_searches: HashSet::new(),
             active_context_compactions: HashSet::new(),
+            active_patch_applies: HashSet::new(),
             active_guardian_assessments: HashSet::new(),
             active_subagents_by_call: HashMap::new(),
             active_subagent_calls_by_thread: HashMap::new(),
@@ -1292,6 +1294,26 @@ impl PromptState {
                     .content(vec![
                         context_compaction_status_text(status).to_string().into(),
                     ]),
+            ));
+        }
+    }
+
+    fn settle_all_patch_applies(&mut self, client: &SessionClient, status: ToolCallStatus) {
+        let content = match status {
+            ToolCallStatus::Completed => "Edit completed.",
+            ToolCallStatus::Failed => "Edit interrupted before completion.",
+            ToolCallStatus::Pending => "Edit pending.",
+            ToolCallStatus::InProgress => "Edit still running.",
+            _ => "Edit status unknown.",
+        }
+        .to_string();
+
+        for call_id in self.active_patch_applies.drain().collect::<Vec<_>>() {
+            client.send_tool_call_update(ToolCallUpdate::new(
+                call_id,
+                ToolCallUpdateFields::new()
+                    .status(status)
+                    .content(vec![content.clone().into()]),
             ));
         }
     }
@@ -2171,6 +2193,7 @@ impl PromptState {
                     self.event_count
                 );
                 self.settle_all_context_compactions(client, ToolCallStatus::Completed);
+                self.settle_all_patch_applies(client, ToolCallStatus::Completed);
                 self.abort_pending_interactions();
                 self.turn_complete = true;
                 if self.turn_collaboration_mode_kind == ModeKind::Plan
@@ -2213,6 +2236,7 @@ impl PromptState {
             }) => {
                 error!("Unhandled error during turn: {message} {codex_error_info:?}");
                 self.settle_all_context_compactions(client, ToolCallStatus::Failed);
+                self.settle_all_patch_applies(client, ToolCallStatus::Failed);
                 self.abort_pending_interactions();
                 self.turn_complete = true;
                 if let Some(response_tx) = self.response_tx.take() {
@@ -2226,6 +2250,7 @@ impl PromptState {
             EventMsg::TurnAborted(TurnAbortedEvent { reason, turn_id, completed_at: _, duration_ms: _ }) => {
                 info!("Turn {turn_id:?} aborted: {reason:?}");
                 self.settle_all_context_compactions(client, ToolCallStatus::Failed);
+                self.settle_all_patch_applies(client, ToolCallStatus::Failed);
                 self.abort_pending_interactions();
                 self.turn_complete = true;
                 if let Some(response_tx) = self.response_tx.take() {
@@ -2235,6 +2260,7 @@ impl PromptState {
             EventMsg::ShutdownComplete => {
                 info!("Agent shutting down");
                 self.settle_all_context_compactions(client, ToolCallStatus::Failed);
+                self.settle_all_patch_applies(client, ToolCallStatus::Failed);
                 self.abort_pending_interactions();
                 self.turn_complete = true;
                 if let Some(response_tx) = self.response_tx.take() {
@@ -2545,7 +2571,7 @@ impl PromptState {
         Ok(())
     }
 
-    fn start_patch_apply(&self, client: &SessionClient, event: PatchApplyBeginEvent) {
+    fn start_patch_apply(&mut self, client: &SessionClient, event: PatchApplyBeginEvent) {
         let raw_input = serde_json::json!(&event);
         let PatchApplyBeginEvent {
             call_id,
@@ -2555,6 +2581,7 @@ impl PromptState {
         } = event;
 
         let (title, locations, content) = extract_tool_call_content_from_changes(changes);
+        self.active_patch_applies.insert(call_id.clone());
 
         client.send_tool_call(
             ToolCall::new(call_id, title)
@@ -2588,7 +2615,7 @@ impl PromptState {
         ));
     }
 
-    fn end_patch_apply(&self, client: &SessionClient, event: PatchApplyEndEvent) {
+    fn end_patch_apply(&mut self, client: &SessionClient, event: PatchApplyEndEvent) {
         let raw_output = serde_json::json!(&event);
         let PatchApplyEndEvent {
             call_id,
@@ -2612,6 +2639,7 @@ impl PromptState {
             _ if success => ToolCallStatus::Completed,
             PatchApplyStatus::Failed | PatchApplyStatus::Declined => ToolCallStatus::Failed,
         };
+        self.active_patch_applies.remove(&call_id);
 
         client.send_tool_call_update(ToolCallUpdate::new(
             call_id,
