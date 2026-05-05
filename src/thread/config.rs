@@ -1,6 +1,8 @@
 use std::sync::LazyLock;
 
 use super::*;
+use codex_core::config::edit::{ConfigEdit, ConfigEditsBuilder};
+use toml_edit::value;
 
 pub(super) static APPROVAL_PRESETS: LazyLock<Vec<ApprovalPreset>> =
     LazyLock::new(builtin_approval_presets);
@@ -104,4 +106,85 @@ pub(super) fn format_service_tier_name(service_tier: Option<ServiceTier>) -> &'s
         Some(ServiceTier::Flex) => "Flex",
         None => "Standard",
     }
+}
+
+fn scoped_config_segments(config: &Config, segments: &[&str]) -> Vec<String> {
+    let mut scoped = Vec::with_capacity(segments.len() + 2);
+    if let Some(profile) = config.active_profile.as_ref() {
+        scoped.push("profiles".to_string());
+        scoped.push(profile.clone());
+    }
+    scoped.extend(segments.iter().map(|segment| (*segment).to_string()));
+    scoped
+}
+
+fn set_scoped_config_value(
+    config: &Config,
+    segments: &[&str],
+    value_str: impl ToString,
+) -> ConfigEdit {
+    ConfigEdit::SetPath {
+        segments: scoped_config_segments(config, segments),
+        value: value(value_str.to_string()),
+    }
+}
+
+fn clear_scoped_config_value(config: &Config, segments: &[&str]) -> ConfigEdit {
+    ConfigEdit::ClearPath {
+        segments: scoped_config_segments(config, segments),
+    }
+}
+
+pub(super) async fn persist_approval_preset_default(
+    config: &Config,
+    preset: &ApprovalPreset,
+) -> Result<(), Error> {
+    let default_permissions = default_permissions_for_session_mode(preset.id)
+        .ok_or_else(|| Error::internal_error().data("Unsupported approval preset"))?;
+
+    ConfigEditsBuilder::new(&config.codex_home)
+        .with_edits([
+            set_scoped_config_value(config, &["approval_policy"], preset.approval),
+            set_scoped_config_value(config, &["default_permissions"], default_permissions),
+            clear_scoped_config_value(config, &["sandbox_mode"]),
+            clear_scoped_config_value(config, &["permission_profile"]),
+        ])
+        .apply()
+        .await
+        .map_err(|e| {
+            Error::internal_error()
+                .data(format!("Updated session, but failed to persist mode: {e}"))
+        })
+}
+
+pub(super) async fn persist_service_tier_default(
+    config: &Config,
+    service_tier: Option<ServiceTier>,
+) -> Result<(), Error> {
+    ConfigEditsBuilder::new(&config.codex_home)
+        .with_profile(config.active_profile.as_deref())
+        .set_service_tier(service_tier)
+        .apply()
+        .await
+        .map_err(|e| {
+            Error::internal_error().data(format!(
+                "Updated session, but failed to persist service tier: {e}"
+            ))
+        })
+}
+
+pub(super) async fn persist_model_default(
+    config: &Config,
+    model: &str,
+    effort: Option<ReasoningEffort>,
+) -> Result<(), Error> {
+    ConfigEditsBuilder::new(&config.codex_home)
+        .with_profile(config.active_profile.as_deref())
+        .set_model(Some(model), effort)
+        .apply()
+        .await
+        .map_err(|e| {
+            Error::internal_error()
+                .data(format!("Updated session, but failed to persist model: {e}"))
+        })
 }

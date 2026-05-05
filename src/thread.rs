@@ -26,11 +26,7 @@ use agent_client_protocol::{
 use codex_apply_patch::parse_patch;
 use codex_core::{
     CodexThread,
-    config::{
-        Config,
-        edit::{ConfigEdit, ConfigEditsBuilder},
-        set_project_trust_level,
-    },
+    config::{Config, set_project_trust_level},
     review_format::format_review_findings_block,
     review_prompts::user_facing_hint,
     util::normalize_thread_name,
@@ -97,7 +93,6 @@ use heck::ToTitleCase;
 use itertools::Itertools;
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
-use toml_edit::value;
 use tracing::{debug, error, info, warn};
 use unicode_segmentation::UnicodeSegmentation;
 use uuid::Uuid;
@@ -119,7 +114,8 @@ use commands::{
 use config::CODEX_WORKSPACE_PROFILE_ID;
 use config::{
     APPROVAL_PRESETS, active_profile_id_for_session_mode, current_session_mode_id,
-    default_permissions_for_session_mode, format_service_tier_name, mode_trusts_project,
+    format_service_tier_name, mode_trusts_project, persist_approval_preset_default,
+    persist_model_default, persist_service_tier_default,
 };
 #[cfg(test)]
 use permissions::{
@@ -3829,48 +3825,6 @@ impl<A: Auth> ThreadActor<A> {
         self.config.developer_instructions = next_mode.settings.developer_instructions;
     }
 
-    fn scoped_config_segments(&self, segments: &[&str]) -> Vec<String> {
-        let mut scoped = Vec::with_capacity(segments.len() + 2);
-        if let Some(profile) = self.config.active_profile.as_ref() {
-            scoped.push("profiles".to_string());
-            scoped.push(profile.clone());
-        }
-        scoped.extend(segments.iter().map(|segment| (*segment).to_string()));
-        scoped
-    }
-
-    fn set_scoped_config_value(&self, segments: &[&str], value_str: impl ToString) -> ConfigEdit {
-        ConfigEdit::SetPath {
-            segments: self.scoped_config_segments(segments),
-            value: value(value_str.to_string()),
-        }
-    }
-
-    fn clear_scoped_config_value(&self, segments: &[&str]) -> ConfigEdit {
-        ConfigEdit::ClearPath {
-            segments: self.scoped_config_segments(segments),
-        }
-    }
-
-    async fn persist_approval_preset_default(&self, preset: &ApprovalPreset) -> Result<(), Error> {
-        let default_permissions = default_permissions_for_session_mode(preset.id)
-            .ok_or_else(|| Error::internal_error().data("Unsupported approval preset"))?;
-
-        ConfigEditsBuilder::new(&self.config.codex_home)
-            .with_edits([
-                self.set_scoped_config_value(&["approval_policy"], preset.approval),
-                self.set_scoped_config_value(&["default_permissions"], default_permissions),
-                self.clear_scoped_config_value(&["sandbox_mode"]),
-                self.clear_scoped_config_value(&["permission_profile"]),
-            ])
-            .apply()
-            .await
-            .map_err(|e| {
-                Error::internal_error()
-                    .data(format!("Updated session, but failed to persist mode: {e}"))
-            })
-    }
-
     async fn set_service_tier(&mut self, service_tier: Option<ServiceTier>) -> Result<(), Error> {
         self.thread
             .submit(Op::OverrideTurnContext {
@@ -3891,7 +3845,7 @@ impl<A: Auth> ThreadActor<A> {
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
 
         self.config.service_tier = service_tier;
-        self.persist_service_tier_default(service_tier).await?;
+        persist_service_tier_default(&self.config, service_tier).await?;
 
         Ok(())
     }
@@ -3946,38 +3900,6 @@ impl<A: Auth> ThreadActor<A> {
             output.push_str(&format!("- `{name}` ({state}) - {transport}\n"));
         }
         output
-    }
-
-    async fn persist_service_tier_default(
-        &self,
-        service_tier: Option<ServiceTier>,
-    ) -> Result<(), Error> {
-        ConfigEditsBuilder::new(&self.config.codex_home)
-            .with_profile(self.config.active_profile.as_deref())
-            .set_service_tier(service_tier)
-            .apply()
-            .await
-            .map_err(|e| {
-                Error::internal_error().data(format!(
-                    "Updated session, but failed to persist service tier: {e}"
-                ))
-            })
-    }
-
-    async fn persist_model_default(
-        &self,
-        model: &str,
-        effort: Option<ReasoningEffort>,
-    ) -> Result<(), Error> {
-        ConfigEditsBuilder::new(&self.config.codex_home)
-            .with_profile(self.config.active_profile.as_deref())
-            .set_model(Some(model), effort)
-            .apply()
-            .await
-            .map_err(|e| {
-                Error::internal_error()
-                    .data(format!("Updated session, but failed to persist model: {e}"))
-            })
     }
 
     async fn handle_set_config_service_tier(
@@ -4044,7 +3966,8 @@ impl<A: Auth> ThreadActor<A> {
 
         self.config.model = Some(model_to_use);
         self.config.model_reasoning_effort = effort_to_use;
-        self.persist_model_default(
+        persist_model_default(
+            &self.config,
             self.config.model.as_deref().unwrap_or_default(),
             self.config.model_reasoning_effort,
         )
@@ -4097,8 +4020,12 @@ impl<A: Auth> ThreadActor<A> {
 
         self.config.model_reasoning_effort = Some(effort);
         let current_model = self.get_current_model().await;
-        self.persist_model_default(&current_model, self.config.model_reasoning_effort)
-            .await?;
+        persist_model_default(
+            &self.config,
+            &current_model,
+            self.config.model_reasoning_effort,
+        )
+        .await?;
 
         Ok(())
     }
@@ -4427,7 +4354,7 @@ impl<A: Auth> ThreadActor<A> {
         self.submissions.insert(submission_id, state);
         self.apply_collaboration_mode(collaboration_mode);
         self.apply_approval_preset(preset)?;
-        self.persist_approval_preset_default(preset).await?;
+        persist_approval_preset_default(&self.config, preset).await?;
 
         Ok(())
     }
@@ -4468,7 +4395,7 @@ impl<A: Auth> ThreadActor<A> {
 
         self.apply_collaboration_mode(collaboration_mode);
         self.apply_approval_preset(preset)?;
-        self.persist_approval_preset_default(preset).await?;
+        persist_approval_preset_default(&self.config, preset).await?;
 
         Ok(())
     }
