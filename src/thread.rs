@@ -10,7 +10,7 @@ use agent_client_protocol::{
     Client, ConnectionTo, Error,
     schema::{
         AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, ClientCapabilities,
-        ConfigOptionUpdate, Content, ContentBlock, ContentChunk, Diff, EmbeddedResource,
+        ConfigOptionUpdate, Content, ContentBlock, ContentChunk, Cost, Diff, EmbeddedResource,
         EmbeddedResourceResource, LoadSessionResponse, Meta, ModelId, ModelInfo, PermissionOption,
         PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptRequest,
         RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
@@ -1087,6 +1087,23 @@ struct ActiveSubagent {
     thread_id: Option<String>,
 }
 
+#[derive(Default)]
+struct AccumulatedUsage {
+    input_tokens: i64,
+    cached_input_tokens: i64,
+    output_tokens: i64,
+    reasoning_output_tokens: i64,
+}
+
+impl AccumulatedUsage {
+    fn add(&mut self, usage: &codex_protocol::protocol::TokenUsage) {
+        self.input_tokens += usage.input_tokens;
+        self.cached_input_tokens += usage.cached_input_tokens;
+        self.output_tokens += usage.output_tokens;
+        self.reasoning_output_tokens += usage.reasoning_output_tokens;
+    }
+}
+
 struct PromptState {
     submission_id: String,
     active_commands: HashMap<String, ActiveCommand>,
@@ -1095,6 +1112,7 @@ struct PromptState {
     active_guardian_assessments: HashSet<String>,
     active_subagents_by_call: HashMap<String, ActiveSubagent>,
     active_subagent_calls_by_thread: HashMap<String, ToolCallId>,
+    accumulated_usage: AccumulatedUsage,
     thread: Arc<dyn CodexThreadImpl>,
     resolution_tx: mpsc::UnboundedSender<ThreadMessage>,
     pending_permission_interactions: HashMap<String, PendingPermissionInteraction>,
@@ -1189,6 +1207,7 @@ impl PromptState {
             active_guardian_assessments: HashSet::new(),
             active_subagents_by_call: HashMap::new(),
             active_subagent_calls_by_thread: HashMap::new(),
+            accumulated_usage: AccumulatedUsage::default(),
             thread,
             resolution_tx,
             pending_permission_interactions: HashMap::new(),
@@ -1779,14 +1798,20 @@ impl PromptState {
                 self.plan_output_text = None;
                 self.prompted_for_plan_implementation = false;
             }
-            EventMsg::TokenCount(TokenCountEvent { info, .. }) => {
+            EventMsg::TokenCount(TokenCountEvent { info, rate_limits }) => {
                 if let Some(info) = info
                     && let Some(size) = info.model_context_window {
-                        let used = info.last_token_usage.tokens_in_context_window().max(0) as u64;
-                        client.send_notification(SessionUpdate::UsageUpdate(UsageUpdate::new(
-                            used,
-                            size as u64,
-                        )));
+                        self.accumulated_usage.add(&info.last_token_usage);
+                        let used = info.total_token_usage.tokens_in_context_window().max(0) as u64;
+                        let mut update = UsageUpdate::new(used, size as u64);
+                        if let Some(rate_limits) = rate_limits
+                            && let Some(credits) = rate_limits.credits
+                            && let Some(balance) = credits.balance
+                            && let Ok(amount) = balance.parse::<f64>()
+                        {
+                            update = update.cost(Cost::new(amount, "USD"));
+                        }
+                        client.send_notification(SessionUpdate::UsageUpdate(update));
                     }
             }
             EventMsg::ItemStarted(ItemStartedEvent { thread_id, turn_id, item }) => {
