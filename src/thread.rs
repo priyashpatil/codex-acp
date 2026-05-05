@@ -624,6 +624,20 @@ fn plan_implementation_request_key(submission_id: &str) -> String {
     format!("plan-implementation:{submission_id}")
 }
 
+fn context_compaction_call_id(item_id: &str) -> String {
+    format!("context-compaction:{item_id}")
+}
+
+fn context_compaction_status_text(status: ToolCallStatus) -> &'static str {
+    match status {
+        ToolCallStatus::Completed => "Context compacted.",
+        ToolCallStatus::Failed => "Context compaction did not complete.",
+        ToolCallStatus::Pending => "Context compaction pending.",
+        ToolCallStatus::InProgress => "Context compaction still running.",
+        _ => "Context compaction state updated.",
+    }
+}
+
 fn mode_kind_as_id(mode: ModeKind) -> &'static str {
     match mode {
         ModeKind::Plan => "plan",
@@ -1077,6 +1091,7 @@ struct PromptState {
     submission_id: String,
     active_commands: HashMap<String, ActiveCommand>,
     active_web_searches: HashSet<String>,
+    active_context_compactions: HashSet<String>,
     active_guardian_assessments: HashSet<String>,
     active_subagents_by_call: HashMap<String, ActiveSubagent>,
     active_subagent_calls_by_thread: HashMap<String, ToolCallId>,
@@ -1170,6 +1185,7 @@ impl PromptState {
             submission_id,
             active_commands: HashMap::new(),
             active_web_searches: HashSet::new(),
+            active_context_compactions: HashSet::new(),
             active_guardian_assessments: HashSet::new(),
             active_subagents_by_call: HashMap::new(),
             active_subagent_calls_by_thread: HashMap::new(),
@@ -1201,6 +1217,63 @@ impl PromptState {
     fn abort_pending_interactions(&mut self) {
         for (_, interaction) in self.pending_permission_interactions.drain() {
             interaction.task.abort();
+        }
+    }
+
+    fn start_context_compaction(&mut self, client: &SessionClient, item_id: &str) {
+        let call_id = context_compaction_call_id(item_id);
+        if !self.active_context_compactions.insert(call_id.clone()) {
+            return;
+        }
+
+        client.send_tool_call(
+            ToolCall::new(call_id, "Compacting context")
+                .kind(ToolKind::Think)
+                .status(ToolCallStatus::InProgress)
+                .content(vec![
+                    "Condensing earlier conversation so the next turn can continue."
+                        .to_string()
+                        .into(),
+                ]),
+        );
+    }
+
+    fn settle_context_compaction(
+        &mut self,
+        client: &SessionClient,
+        item_id: &str,
+        status: ToolCallStatus,
+    ) {
+        let call_id = context_compaction_call_id(item_id);
+        let content = context_compaction_status_text(status).to_string();
+
+        if self.active_context_compactions.remove(&call_id) {
+            client.send_tool_call_update(ToolCallUpdate::new(
+                call_id,
+                ToolCallUpdateFields::new()
+                    .status(status)
+                    .content(vec![content.into()]),
+            ));
+        } else if matches!(status, ToolCallStatus::Completed | ToolCallStatus::Failed) {
+            client.send_tool_call(
+                ToolCall::new(call_id, "Compacting context")
+                    .kind(ToolKind::Think)
+                    .status(status)
+                    .content(vec![content.into()]),
+            );
+        }
+    }
+
+    fn settle_all_context_compactions(&mut self, client: &SessionClient, status: ToolCallStatus) {
+        for call_id in self.active_context_compactions.drain().collect::<Vec<_>>() {
+            client.send_tool_call_update(ToolCallUpdate::new(
+                call_id,
+                ToolCallUpdateFields::new()
+                    .status(status)
+                    .content(vec![
+                        context_compaction_status_text(status).to_string().into(),
+                    ]),
+            ));
         }
     }
 
@@ -1718,6 +1791,9 @@ impl PromptState {
             }
             EventMsg::ItemStarted(ItemStartedEvent { thread_id, turn_id, item }) => {
                 info!("Item started with thread_id: {thread_id}, turn_id: {turn_id}, item: {item:?}");
+                if let TurnItem::ContextCompaction(item) = item {
+                    self.start_context_compaction(client, &item.id);
+                }
             }
             EventMsg::UserMessage(UserMessageEvent {
                 message,
@@ -2049,9 +2125,19 @@ impl PromptState {
                 item,
             }) => {
                 info!("Item completed: thread_id={}, turn_id={}, item={:?}", thread_id, turn_id, item);
-                if let TurnItem::Plan(plan_item) = item {
-                    self.saw_plan_output = true;
-                    self.plan_output_text = Some(plan_item.text);
+                match item {
+                    TurnItem::Plan(plan_item) => {
+                        self.saw_plan_output = true;
+                        self.plan_output_text = Some(plan_item.text);
+                    }
+                    TurnItem::ContextCompaction(item) => {
+                        self.settle_context_compaction(
+                            client,
+                            &item.id,
+                            ToolCallStatus::Completed,
+                        );
+                    }
+                    _ => {}
                 }
             }
             EventMsg::TurnComplete(TurnCompleteEvent { last_agent_message, turn_id, completed_at: _, duration_ms: _, time_to_first_token_ms: _, }) => {
@@ -2059,6 +2145,7 @@ impl PromptState {
                     "Task {turn_id} completed successfully after {} events. Last agent message: {last_agent_message:?}",
                     self.event_count
                 );
+                self.settle_all_context_compactions(client, ToolCallStatus::Completed);
                 self.abort_pending_interactions();
                 self.turn_complete = true;
                 if self.turn_collaboration_mode_kind == ModeKind::Plan
@@ -2100,6 +2187,7 @@ impl PromptState {
                 codex_error_info,
             }) => {
                 error!("Unhandled error during turn: {message} {codex_error_info:?}");
+                self.settle_all_context_compactions(client, ToolCallStatus::Failed);
                 self.abort_pending_interactions();
                 self.turn_complete = true;
                 if let Some(response_tx) = self.response_tx.take() {
@@ -2112,6 +2200,7 @@ impl PromptState {
             }
             EventMsg::TurnAborted(TurnAbortedEvent { reason, turn_id, completed_at: _, duration_ms: _ }) => {
                 info!("Turn {turn_id:?} aborted: {reason:?}");
+                self.settle_all_context_compactions(client, ToolCallStatus::Failed);
                 self.abort_pending_interactions();
                 self.turn_complete = true;
                 if let Some(response_tx) = self.response_tx.take() {
@@ -2120,6 +2209,7 @@ impl PromptState {
             }
             EventMsg::ShutdownComplete => {
                 info!("Agent shutting down");
+                self.settle_all_context_compactions(client, ToolCallStatus::Failed);
                 self.abort_pending_interactions();
                 self.turn_complete = true;
                 if let Some(response_tx) = self.response_tx.take() {
