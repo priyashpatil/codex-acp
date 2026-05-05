@@ -29,7 +29,7 @@ use codex_protocol::{
 };
 use std::{
     collections::{HashMap, HashSet},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::{Arc, Mutex},
 };
 use tracing::{debug, info, warn};
@@ -752,6 +752,15 @@ impl CodexAgent {
         self.check_auth().await?;
 
         let ListSessionsRequest { cwd, cursor, .. } = request;
+        let effective_cwd = cwd.or_else(|| {
+            self.session_roots
+                .lock()
+                .ok()
+                .and_then(|roots| roots.values().next().cloned())
+        });
+        let normalized_filter_cwd = effective_cwd
+            .as_ref()
+            .map(|cwd| normalize_path_for_filter(cwd));
         let cursor_obj = cursor.as_deref().and_then(parse_cursor);
 
         let page = RolloutRecorder::list_threads(
@@ -780,8 +789,8 @@ impl CodexAgent {
                 let thread_id = item.thread_id?;
                 let item_cwd = item.cwd?;
 
-                if let Some(filter_cwd) = cwd.as_ref()
-                    && item_cwd != *filter_cwd
+                if let Some(filter_cwd) = normalized_filter_cwd.as_ref()
+                    && normalize_path_for_filter(&item_cwd) != *filter_cwd
                 {
                     return None;
                 }
@@ -999,4 +1008,22 @@ fn format_session_title(message: &str) -> Option<String> {
     } else {
         Some(truncate_graphemes(trimmed, SESSION_TITLE_MAX_GRAPHEMES))
     }
+}
+
+fn normalize_path_for_filter(path: &Path) -> PathBuf {
+    if let Ok(canonical) = path.canonicalize() {
+        return canonical;
+    }
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
 }
