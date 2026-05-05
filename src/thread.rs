@@ -4306,6 +4306,7 @@ impl<A: Auth> ThreadActor<A> {
             ),
             AvailableCommand::new("stop", "stop all background terminals"),
             AvailableCommand::new("mcp", "list configured MCP servers"),
+            AvailableCommand::new("skills", "list available Codex skills"),
         ]
     }
 
@@ -4740,6 +4741,23 @@ impl<A: Auth> ThreadActor<A> {
         output
     }
 
+    fn format_skills(&self) -> String {
+        if self.skills.is_empty() {
+            return "No Codex skills available.\n".to_string();
+        }
+
+        let mut output = String::from("## Codex Skills\n\n");
+        for skill in self.skills.iter().sorted_by_key(|skill| skill.name.as_str()) {
+            let state = if skill.enabled { "enabled" } else { "disabled" };
+            output.push_str(&format!(
+                "- `{}` ({state}) - {}\n",
+                skill.name,
+                skill.path.display()
+            ));
+        }
+        output
+    }
+
     async fn persist_service_tier_default(
         &self,
         service_tier: Option<ServiceTier>,
@@ -5079,6 +5097,11 @@ impl<A: Auth> ThreadActor<A> {
                     "stop" => op = Op::CleanBackgroundTerminals,
                     "mcp" => {
                         self.client.send_agent_text(self.format_mcp_servers());
+                        response_tx.send(Ok(StopReason::EndTurn)).ok();
+                        return Ok(response_rx);
+                    }
+                    "skills" => {
+                        self.client.send_agent_text(self.format_skills());
                         response_tx.send(Ok(StopReason::EndTurn)).ok();
                         return Ok(response_rx);
                     }
