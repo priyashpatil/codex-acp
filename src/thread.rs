@@ -67,8 +67,8 @@ use codex_protocol::{
         McpStartupCompleteEvent, McpStartupUpdateEvent, McpToolCallBeginEvent, McpToolCallEndEvent,
         ModelRerouteEvent, NetworkApprovalContext, NetworkPolicyRuleAction, Op,
         PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus, PatchApplyUpdatedEvent,
-        ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent, ReviewDecision,
-        ReviewOutputEvent, ReviewRequest, ReviewTarget, RolloutItem, SkillMetadata,
+        RawResponseItemEvent, ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent,
+        ReviewDecision, ReviewOutputEvent, ReviewRequest, ReviewTarget, RolloutItem, SkillMetadata,
         SkillsListEntry, StreamErrorEvent, TerminalInteractionEvent, ThreadGoalStatus,
         ThreadGoalUpdatedEvent, TokenCountEvent, TurnAbortedEvent, TurnCompleteEvent,
         TurnStartedEvent, UserMessageEvent, ViewImageToolCallEvent, WarningEvent,
@@ -359,6 +359,7 @@ enum ThreadMessage {
     },
     SubmitPlanImplementation {
         approval_preset_id: String,
+        response_tx: Option<oneshot::Sender<Result<StopReason, Error>>>,
     },
     PermissionRequestResolved {
         submission_id: String,
@@ -906,6 +907,14 @@ fn agent_status_to_tool_status(status: &AgentStatus) -> ToolCallStatus {
         }
         AgentStatus::Completed(_) | AgentStatus::Shutdown => ToolCallStatus::Completed,
         AgentStatus::Errored(_) | AgentStatus::NotFound => ToolCallStatus::Failed,
+    }
+}
+
+fn response_item_status_to_tool_status(status: &str) -> ToolCallStatus {
+    match status {
+        "completed" | "success" => ToolCallStatus::Completed,
+        "failed" | "incomplete" | "cancelled" => ToolCallStatus::Failed,
+        _ => ToolCallStatus::InProgress,
     }
 }
 
@@ -1571,10 +1580,12 @@ impl PromptState {
                         "User accepted plan",
                         "accept_plan",
                     );
+                    let response_tx = self.response_tx.take();
                     drop(
                         self.resolution_tx
                             .send(ThreadMessage::SubmitPlanImplementation {
                                 approval_preset_id: approval_preset_id.to_string(),
+                                response_tx,
                             }),
                     );
                 } else {
@@ -1585,6 +1596,9 @@ impl PromptState {
                         "Plan rejected",
                         "stay_in_plan",
                     );
+                    if let Some(response_tx) = self.response_tx.take() {
+                        response_tx.send(Ok(StopReason::EndTurn)).ok();
+                    }
                 }
             }
             PendingPermissionRequest::UserInput {
@@ -1985,8 +1999,7 @@ impl PromptState {
                     && !self.prompted_for_plan_implementation
                 {
                     self.spawn_plan_implementation_request(client);
-                }
-                if let Some(response_tx) = self.response_tx.take() {
+                } else if let Some(response_tx) = self.response_tx.take() {
                     response_tx.send(Ok(StopReason::EndTurn)).ok();
                 }
             }
@@ -2135,6 +2148,9 @@ impl PromptState {
                 );
                 self.guardian_assessment(client, event);
             }
+            EventMsg::RawResponseItem(event) => {
+                self.raw_response_item(client, event);
+            }
 
             // Ignore these events
             EventMsg::ImageGenerationBegin(..)
@@ -2152,7 +2168,6 @@ impl PromptState {
             | EventMsg::AgentMessageDelta(..)
             | EventMsg::AgentReasoningDelta(..)
             | EventMsg::AgentReasoningRawContentDelta(..)
-            | EventMsg::RawResponseItem(..)
             | EventMsg::RealtimeConversationStarted(..)
             | EventMsg::RealtimeConversationRealtime(..)
             | EventMsg::RealtimeConversationClosed(..)
@@ -3394,6 +3409,74 @@ impl PromptState {
             }
         }
     }
+
+    fn raw_response_item(&self, client: &SessionClient, event: RawResponseItemEvent) {
+        match event.item {
+            ResponseItem::ToolSearchCall {
+                call_id,
+                status,
+                execution,
+                arguments,
+                ..
+            } => {
+                let call_id = call_id.unwrap_or_else(|| generate_fallback_id("tool_search"));
+                client.send_tool_call(
+                    ToolCall::new(call_id, format!("Search tools via {execution}"))
+                        .kind(ToolKind::Search)
+                        .status(
+                            status
+                                .as_deref()
+                                .map(response_item_status_to_tool_status)
+                                .unwrap_or(ToolCallStatus::InProgress),
+                        )
+                        .raw_input(arguments),
+                );
+            }
+            ResponseItem::ToolSearchOutput {
+                call_id: Some(call_id),
+                status,
+                execution,
+                tools,
+            } => {
+                client.send_tool_call_update(ToolCallUpdate::new(
+                    call_id,
+                    ToolCallUpdateFields::new()
+                        .status(response_item_status_to_tool_status(&status))
+                        .title(format!("Tool search completed via {execution}"))
+                        .raw_output(serde_json::json!({
+                            "status": status,
+                            "execution": execution,
+                            "tools": tools,
+                        })),
+                ));
+            }
+            ResponseItem::ImageGenerationCall {
+                id,
+                status,
+                revised_prompt,
+                result,
+            } => {
+                let content = revised_prompt.as_ref().map(|prompt| {
+                    vec![ToolCallContent::Content(Content::new(ContentBlock::Text(
+                        TextContent::new(prompt.clone()),
+                    )))]
+                });
+                let mut tool_call = ToolCall::new(id, "Generate image")
+                    .kind(ToolKind::Other)
+                    .status(response_item_status_to_tool_status(&status))
+                    .raw_output(serde_json::json!({
+                        "status": status,
+                        "revised_prompt": revised_prompt,
+                        "result": result,
+                    }));
+                if let Some(content) = content {
+                    tool_call = tool_call.content(content);
+                }
+                client.send_tool_call(tool_call);
+            }
+            _ => {}
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -3921,8 +4004,14 @@ impl<A: Auth> ThreadActor<A> {
                 let result = self.handle_replay_history(history);
                 drop(response_tx.send(result));
             }
-            ThreadMessage::SubmitPlanImplementation { approval_preset_id } => {
-                if let Err(err) = self.submit_plan_implementation(&approval_preset_id).await {
+            ThreadMessage::SubmitPlanImplementation {
+                approval_preset_id,
+                response_tx,
+            } => {
+                if let Err(err) = self
+                    .submit_plan_implementation(&approval_preset_id, response_tx)
+                    .await
+                {
                     error!("Failed to submit accepted plan implementation: {err:?}");
                     self.client
                         .send_agent_text(format!("Failed to start implementation: {err}"));
@@ -4603,9 +4692,29 @@ impl<A: Auth> ThreadActor<A> {
         Ok(response_rx)
     }
 
-    async fn submit_plan_implementation(&mut self, approval_preset_id: &str) -> Result<(), Error> {
-        let preset = Self::approval_preset(approval_preset_id)?;
-        let collaboration_mode = self.collaboration_mode_for(ModeKind::Default).await?;
+    async fn submit_plan_implementation(
+        &mut self,
+        approval_preset_id: &str,
+        mut response_tx: Option<oneshot::Sender<Result<StopReason, Error>>>,
+    ) -> Result<(), Error> {
+        let preset = match Self::approval_preset(approval_preset_id) {
+            Ok(preset) => preset,
+            Err(err) => {
+                if let Some(response_tx) = response_tx.take() {
+                    response_tx.send(Err(err.clone())).ok();
+                }
+                return Err(err);
+            }
+        };
+        let collaboration_mode = match self.collaboration_mode_for(ModeKind::Default).await {
+            Ok(collaboration_mode) => collaboration_mode,
+            Err(err) => {
+                if let Some(response_tx) = response_tx.take() {
+                    response_tx.send(Err(err.clone())).ok();
+                }
+                return Err(err);
+            }
+        };
         let op = Op::UserInputWithTurnContext {
             items: vec![UserInput::Text {
                 text: PLAN_IMPLEMENTATION_CODING_MESSAGE.to_string(),
@@ -4630,13 +4739,21 @@ impl<A: Auth> ThreadActor<A> {
             personality: None,
         };
 
-        let submission_id = self
-            .thread
-            .submit(op)
-            .await
-            .map_err(|e| Error::internal_error().data(e.to_string()))?;
+        let submission_id = match self.thread.submit(op).await {
+            Ok(submission_id) => submission_id,
+            Err(error) => {
+                let err = Error::internal_error().data(error.to_string());
+                if let Some(response_tx) = response_tx.take() {
+                    response_tx.send(Err(err.clone())).ok();
+                }
+                return Err(err);
+            }
+        };
 
-        let (response_tx, _response_rx) = oneshot::channel();
+        let response_tx = response_tx.unwrap_or_else(|| {
+            let (response_tx, _response_rx) = oneshot::channel();
+            response_tx
+        });
         let state = SubmissionState::Prompt(PromptState::new(
             submission_id.clone(),
             self.thread.clone(),
@@ -5107,6 +5224,72 @@ impl<A: Auth> ThreadActor<A> {
                         .kind(ToolKind::Search)
                         .status(ToolCallStatus::Completed),
                 );
+            }
+            ResponseItem::ToolSearchCall {
+                call_id,
+                status,
+                execution,
+                arguments,
+                ..
+            } => {
+                self.client.send_tool_call(
+                    ToolCall::new(
+                        call_id
+                            .clone()
+                            .unwrap_or_else(|| generate_fallback_id("tool_search")),
+                        format!("Search tools via {execution}"),
+                    )
+                    .kind(ToolKind::Search)
+                    .status(
+                        status
+                            .as_deref()
+                            .map(response_item_status_to_tool_status)
+                            .unwrap_or(ToolCallStatus::Completed),
+                    )
+                    .raw_input(arguments.clone()),
+                );
+            }
+            ResponseItem::ToolSearchOutput {
+                call_id: Some(call_id),
+                status,
+                execution,
+                tools,
+            } => {
+                self.client.send_tool_call_update(ToolCallUpdate::new(
+                    call_id.clone(),
+                    ToolCallUpdateFields::new()
+                        .status(response_item_status_to_tool_status(status))
+                        .title(format!("Tool search completed via {execution}"))
+                        .raw_output(serde_json::json!({
+                            "status": status,
+                            "execution": execution,
+                            "tools": tools,
+                        })),
+                ));
+            }
+            ResponseItem::ImageGenerationCall {
+                id,
+                status,
+                revised_prompt,
+                result,
+            } => {
+                let content = revised_prompt.as_ref().map(|prompt| {
+                    vec![ToolCallContent::Content(Content::new(ContentBlock::Text(
+                        TextContent::new(prompt.clone()),
+                    )))]
+                });
+                let mut tool_call = ToolCall::new(id.clone(), "Generate image")
+                    .kind(ToolKind::Other)
+                    .status(response_item_status_to_tool_status(status))
+                    .raw_output(serde_json::json!({
+                        "status": status,
+                        "revised_prompt": revised_prompt,
+                        "result": result,
+                    }));
+                if let Some(content) = content {
+                    tool_call = tool_call.content(content);
+                }
+                self.client.send_tool_call(tool_call);
             }
             // Skip GhostSnapshot, Compaction, Other, LocalShellCall without call_id
             _ => {}
@@ -6366,9 +6549,9 @@ mod tests {
             Some(Op::OverrideTurnContext {
                 collaboration_mode: Some(mode),
                 approval_policy: Some(_),
-                sandbox_policy: Some(_),
+                permission_profile: Some(permission_profile),
                 ..
-            }) if mode.mode == ModeKind::Default
+            }) if mode.mode == ModeKind::Default && permission_profile == &PermissionProfile::Disabled
         ));
 
         Ok(())
@@ -6517,9 +6700,10 @@ mod tests {
                             items,
                             collaboration_mode: Some(mode),
                             approval_policy: Some(_),
-                            sandbox_policy: Some(_),
+                            permission_profile: Some(permission_profile),
                             ..
                         } if mode.mode == ModeKind::Default
+                            && permission_profile == &PermissionProfile::workspace_write()
                             && matches!(
                                 items.as_slice(),
                                 [UserInput::Text { text, .. }]
@@ -6617,6 +6801,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_plan_completion_keeps_prompt_active_until_accept_decision() -> anyhow::Result<()>
+    {
+        let notify = Arc::new(Notify::new());
+        let client = Arc::new(StubClient::with_blocked_permission_requests(
+            vec![RequestPermissionResponse::new(
+                RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
+                    PLAN_IMPLEMENTATION_ACCEPT_DEFAULT_OPTION_ID,
+                )),
+            )],
+            notify.clone(),
+        ));
+        let (session_id, _client, _thread, message_tx, _handle) = setup_with_client(client).await?;
+
+        let (mode_response_tx, mode_response_rx) = tokio::sync::oneshot::channel();
+        message_tx.send(ThreadMessage::SetMode {
+            mode: SessionModeId::new("plan"),
+            response_tx: mode_response_tx,
+        })?;
+        mode_response_rx.await??;
+
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id, vec!["plan-turn".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+        let mut stop_reason_rx = prompt_response_rx.await??;
+
+        tokio::select! {
+            result = &mut stop_reason_rx => {
+                panic!("plan prompt ended before the accept/reject decision: {result:?}");
+            }
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+
+        notify.notify_waiters();
+        assert_eq!(stop_reason_rx.await??, StopReason::EndTurn);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_plan_completion_accept_can_continue_with_full_access_profile()
     -> anyhow::Result<()> {
         let client = Arc::new(StubClient::with_permission_responses(vec![
@@ -6648,9 +6873,10 @@ mod tests {
                         op,
                         Op::UserInputWithTurnContext {
                             collaboration_mode: Some(mode),
-                            sandbox_policy: Some(SandboxPolicy::DangerFullAccess),
+                            permission_profile: Some(permission_profile),
                             ..
                         } if mode.mode == ModeKind::Default
+                            && permission_profile == &PermissionProfile::Disabled
                     )
                 });
                 if has_full_access_implementation {
@@ -7192,6 +7418,48 @@ mod tests {
                                 duration_ms: None,
                                 time_to_first_token_ms: None,
                             }));
+                        } else if prompt == "raw-tool-items" {
+                            let turn_id = id.to_string();
+                            let send = |msg| {
+                                self.op_tx
+                                    .send(Event {
+                                        id: id.to_string(),
+                                        msg,
+                                    })
+                                    .unwrap();
+                            };
+                            send(EventMsg::RawResponseItem(RawResponseItemEvent {
+                                item: ResponseItem::ToolSearchCall {
+                                    id: None,
+                                    call_id: Some("tool-search-a".to_string()),
+                                    status: Some("in_progress".to_string()),
+                                    execution: "server".to_string(),
+                                    arguments: serde_json::json!({ "query": "repo" }),
+                                },
+                            }));
+                            send(EventMsg::RawResponseItem(RawResponseItemEvent {
+                                item: ResponseItem::ToolSearchOutput {
+                                    call_id: Some("tool-search-a".to_string()),
+                                    status: "completed".to_string(),
+                                    execution: "server".to_string(),
+                                    tools: vec![serde_json::json!({ "name": "repo-search" })],
+                                },
+                            }));
+                            send(EventMsg::RawResponseItem(RawResponseItemEvent {
+                                item: ResponseItem::ImageGenerationCall {
+                                    id: "image-a".to_string(),
+                                    status: "completed".to_string(),
+                                    revised_prompt: Some("A compact interface mockup".to_string()),
+                                    result: "image-bytes".to_string(),
+                                },
+                            }));
+                            send(EventMsg::TurnComplete(TurnCompleteEvent {
+                                last_agent_message: None,
+                                turn_id,
+                                completed_at: None,
+                                duration_ms: None,
+                                time_to_first_token_ms: None,
+                            }));
                         } else {
                             self.op_tx
                                 .send(Event {
@@ -7647,6 +7915,53 @@ mod tests {
             }),
             "expected close update, got {tool_updates:?}"
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_raw_response_items_surface_missing_tool_calls() -> anyhow::Result<()> {
+        let (session_id, client, _, message_tx, _handle) = setup().await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["raw-tool-items".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        let stop_reason = prompt_response_rx.await??.await??;
+        assert_eq!(stop_reason, StopReason::EndTurn);
+        drop(message_tx);
+
+        let notifications = client.notifications.lock().unwrap();
+        assert!(notifications.iter().any(|notification| matches!(
+            &notification.update,
+            SessionUpdate::ToolCall(tool_call)
+                if tool_call.tool_call_id.0.as_ref() == "tool-search-a"
+                    && tool_call.title == "Search tools via server"
+                    && tool_call.status == ToolCallStatus::InProgress
+        )));
+        assert!(notifications.iter().any(|notification| matches!(
+            &notification.update,
+            SessionUpdate::ToolCallUpdate(update)
+                if update.tool_call_id.0.as_ref() == "tool-search-a"
+                    && update.fields.status == Some(ToolCallStatus::Completed)
+                    && update.fields.title.as_deref() == Some("Tool search completed via server")
+        )));
+        assert!(notifications.iter().any(|notification| matches!(
+            &notification.update,
+            SessionUpdate::ToolCall(tool_call)
+                if tool_call.tool_call_id.0.as_ref() == "image-a"
+                    && tool_call.title == "Generate image"
+                    && tool_call.status == ToolCallStatus::Completed
+                    && matches!(
+                        tool_call.content.as_slice(),
+                        [ToolCallContent::Content(Content {
+                            content: ContentBlock::Text(TextContent { text, .. }),
+                            ..
+                        })] if text == "A compact interface mockup"
+                    )
+        )));
 
         Ok(())
     }
