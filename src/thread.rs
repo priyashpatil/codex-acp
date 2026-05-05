@@ -161,13 +161,6 @@ fn approval_matches_current_config(preset: &ApprovalPreset, config: &Config) -> 
         == std::mem::discriminant(config.permissions.approval_policy.get())
 }
 
-fn mode_id_if_approval_matches(mode_id: &'static str, config: &Config) -> Option<SessionModeId> {
-    APPROVAL_PRESETS
-        .iter()
-        .find(|preset| preset.id == mode_id && approval_matches_current_config(preset, config))
-        .map(|preset| SessionModeId::new(preset.id))
-}
-
 fn untrusted_read_only_mode_id(config: &Config) -> Option<SessionModeId> {
     // When the project is untrusted, the approval policy won't match since
     // AskForApproval::UnlessTrusted is not part of the default presets.
@@ -209,9 +202,9 @@ fn semantic_session_mode_id_for_permission_profile(config: &Config) -> Option<&'
 
 fn current_session_mode_id(config: &Config) -> Option<SessionModeId> {
     if let Some(active_profile) = config.permissions.active_permission_profile().as_ref() {
-        return session_mode_id_for_active_profile(&active_profile.id)
-            .and_then(|mode_id| mode_id_if_approval_matches(mode_id, config))
-            .or_else(|| untrusted_read_only_mode_id(config));
+        if let Some(mode_id) = session_mode_id_for_active_profile(&active_profile.id) {
+            return Some(SessionModeId::new(mode_id));
+        }
     }
 
     if let Some(preset) = APPROVAL_PRESETS.iter().find(|preset| {
@@ -222,7 +215,7 @@ fn current_session_mode_id(config: &Config) -> Option<SessionModeId> {
     }
 
     semantic_session_mode_id_for_permission_profile(config)
-        .and_then(|mode_id| mode_id_if_approval_matches(mode_id, config))
+        .map(SessionModeId::new)
         .or_else(|| untrusted_read_only_mode_id(config))
 }
 
@@ -4416,6 +4409,15 @@ impl<A: Auth> ThreadActor<A> {
             }
             available_modes.push(session_mode);
         }
+        if !available_modes
+            .iter()
+            .any(|mode| mode.id.0.as_ref() == mode_kind_as_id(ModeKind::Plan))
+        {
+            available_modes.push(
+                SessionMode::new(mode_kind_as_id(ModeKind::Plan), "Plan")
+                    .description(PLAN_MODE_DESCRIPTION),
+            );
+        }
 
         let current_mode_id = if self.current_collaboration_mode_kind == ModeKind::Default {
             approval_mode_id
@@ -4482,9 +4484,7 @@ impl<A: Auth> ThreadActor<A> {
                     modes.current_mode_id.0,
                     select_options,
                 )
-                .category(SessionConfigOptionCategory::Other(
-                    "_approval_preset".to_string(),
-                ))
+                .category(SessionConfigOptionCategory::Mode)
                 .description("Choose a session mode or approval preset"),
             );
         }
@@ -5004,10 +5004,15 @@ impl<A: Auth> ThreadActor<A> {
     }
 
     async fn handle_load(&mut self) -> Result<LoadSessionResponse, Error> {
-        Ok(LoadSessionResponse::new()
+        let response = LoadSessionResponse::new()
             .models(self.models().await?)
             .modes(self.modes().await)
-            .config_options(self.config_options().await?))
+            .config_options(self.config_options().await?);
+
+        self.send_available_commands_update();
+        self.maybe_emit_config_options_update().await;
+
+        Ok(response)
     }
 
     async fn handle_prompt(
@@ -7201,8 +7206,7 @@ mod tests {
         assert_eq!(primary_option.id.0.as_ref(), "mode");
         assert!(matches!(
             primary_option.category.as_ref(),
-            Some(SessionConfigOptionCategory::Other(category))
-                if category == "_approval_preset"
+            Some(SessionConfigOptionCategory::Mode)
         ));
         assert!(
             options
