@@ -4082,6 +4082,13 @@ impl<A: Auth> ThreadActor<A> {
                     "optional: on|off|status",
                 )),
             ),
+            AvailableCommand::new("diff", "show git diff including untracked files"),
+            AvailableCommand::new(
+                "status",
+                "show current session configuration and token usage",
+            ),
+            AvailableCommand::new("stop", "stop all background terminals"),
+            AvailableCommand::new("mcp", "list configured MCP servers"),
         ]
     }
 
@@ -4468,6 +4475,54 @@ impl<A: Auth> ThreadActor<A> {
         Ok(())
     }
 
+    async fn format_session_status(&self) -> String {
+        let model = self.get_current_model().await;
+        let mode = self
+            .modes()
+            .await
+            .and_then(|modes| {
+                modes
+                    .available_modes
+                    .into_iter()
+                    .find(|mode| mode.id == modes.current_mode_id)
+                    .map(|mode| mode.name)
+            })
+            .unwrap_or_else(|| "unknown".to_string());
+        let reasoning = self
+            .config
+            .model_reasoning_effort
+            .map(|effort| effort.to_string())
+            .unwrap_or_else(|| "default".to_string());
+
+        format!(
+            "## Session Status\n\n**Model:** {model}\n**Reasoning Effort:** {reasoning}\n**Mode:** {mode}\n**Service Tier:** {}\n**Working Directory:** {}\n",
+            format_service_tier_name(self.config.service_tier),
+            self.config.cwd.display()
+        )
+    }
+
+    fn format_mcp_servers(&self) -> String {
+        let servers = self.config.mcp_servers.get();
+        if servers.is_empty() {
+            return "No MCP servers configured.\n".to_string();
+        }
+
+        let mut output = String::from("## MCP Servers\n\n");
+        for (name, server) in servers.iter().sorted_by_key(|(name, _)| name.as_str()) {
+            let transport = match &server.transport {
+                codex_config::McpServerTransportConfig::Stdio { command, .. } => {
+                    format!("stdio: {command}")
+                }
+                codex_config::McpServerTransportConfig::StreamableHttp { url, .. } => {
+                    format!("http: {url}")
+                }
+            };
+            let state = if server.enabled { "enabled" } else { "disabled" };
+            output.push_str(&format!("- `{name}` ({state}) - {transport}\n"));
+        }
+        output
+    }
+
     async fn persist_service_tier_default(
         &self,
         service_tier: Option<ServiceTier>,
@@ -4789,6 +4844,24 @@ impl<A: Auth> ThreadActor<A> {
                         };
                         self.client
                             .send_agent_text(format!("Fast mode is {status}.\n"));
+                        response_tx.send(Ok(StopReason::EndTurn)).ok();
+                        return Ok(response_rx);
+                    }
+                    "diff" => {
+                        let output = run_git_diff(&self.config.cwd).await;
+                        self.client.send_agent_text(output);
+                        response_tx.send(Ok(StopReason::EndTurn)).ok();
+                        return Ok(response_rx);
+                    }
+                    "status" => {
+                        let status = self.format_session_status().await;
+                        self.client.send_agent_text(status);
+                        response_tx.send(Ok(StopReason::EndTurn)).ok();
+                        return Ok(response_rx);
+                    }
+                    "stop" => op = Op::CleanBackgroundTerminals,
+                    "mcp" => {
+                        self.client.send_agent_text(self.format_mcp_servers());
                         response_tx.send(Ok(StopReason::EndTurn)).ok();
                         return Ok(response_rx);
                     }
@@ -5833,6 +5906,67 @@ fn web_search_action_to_title_and_id(
 /// Generate a fallback ID using UUID (used when id is missing)
 fn generate_fallback_id(prefix: &str) -> String {
     format!("{}_{}", prefix, Uuid::new_v4())
+}
+
+fn format_service_tier_name(service_tier: Option<ServiceTier>) -> &'static str {
+    match service_tier {
+        Some(ServiceTier::Fast) => "Fast",
+        Some(ServiceTier::Flex) => "Flex",
+        None => "Standard",
+    }
+}
+
+async fn run_git_diff(cwd: &Path) -> String {
+    let cwd = cwd.to_path_buf();
+    match tokio::task::spawn_blocking(move || {
+        let mut output = String::new();
+
+        append_git_output(&mut output, &cwd, "Staged Changes", &["diff", "--cached"]);
+        append_git_output(&mut output, &cwd, "Unstaged Changes", &["diff"]);
+
+        if let Ok(result) = std::process::Command::new("git")
+            .args(["ls-files", "--others", "--exclude-standard"])
+            .current_dir(&cwd)
+            .output()
+        {
+            let untracked = String::from_utf8_lossy(&result.stdout);
+            if !untracked.trim().is_empty() {
+                output.push_str("## Untracked Files\n\n");
+                for file in untracked.lines() {
+                    output.push_str(&format!("- {file}\n"));
+                }
+                output.push('\n');
+            }
+        }
+
+        if output.trim().is_empty() {
+            "No git changes.\n".to_string()
+        } else {
+            output
+        }
+    })
+    .await
+    {
+        Ok(output) => output,
+        Err(err) => format!("Failed to collect git diff: {err}\n"),
+    }
+}
+
+fn append_git_output(output: &mut String, cwd: &Path, title: &str, args: &[&str]) {
+    let Ok(result) = std::process::Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+    else {
+        return;
+    };
+
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    if stdout.trim().is_empty() {
+        return;
+    }
+
+    output.push_str(&format!("## {title}\n\n```diff\n{stdout}```\n\n"));
 }
 
 /// Checks if a prompt is slash command
