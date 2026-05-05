@@ -38,7 +38,9 @@ use codex_protocol::{
         ElicitationRequest, ElicitationRequestEvent, GuardianAssessmentAction,
         GuardianCommandSource,
     },
-    config_types::{CollaborationMode, CollaborationModeMask, ModeKind, Settings, TrustLevel},
+    config_types::{
+        CollaborationMode, CollaborationModeMask, ModeKind, ServiceTier, Settings, TrustLevel,
+    },
     dynamic_tools::{DynamicToolCallOutputContentItem, DynamicToolCallRequest},
     error::CodexErr,
     items::TurnItem,
@@ -4075,6 +4077,11 @@ impl<A: Auth> ThreadActor<A> {
             ),
             AvailableCommand::new("undo", "undo Codex’s most recent turn"),
             AvailableCommand::new("logout", "logout of Codex"),
+            AvailableCommand::new("fast", "toggle fast mode for this session").input(
+                AvailableCommandInput::Unstructured(UnstructuredCommandInput::new(
+                    "optional: on|off|status",
+                )),
+            ),
         ]
     }
 
@@ -4218,6 +4225,14 @@ impl<A: Auth> ThreadActor<A> {
         Some((model.to_owned(), reasoning))
     }
 
+    fn current_service_tier_id(&self) -> &'static str {
+        match self.config.service_tier {
+            Some(ServiceTier::Fast) => "fast",
+            Some(ServiceTier::Flex) => "flex",
+            None => "standard",
+        }
+    }
+
     async fn config_options(&self) -> Result<Vec<SessionConfigOption>, Error> {
         let mut options = Vec::new();
 
@@ -4271,6 +4286,22 @@ impl<A: Auth> ThreadActor<A> {
             SessionConfigOption::select("model", "Model", current_model, model_select_options)
                 .category(SessionConfigOptionCategory::Model)
                 .description("Choose which model Codex should use"),
+        );
+
+        options.push(
+            SessionConfigOption::select(
+                "service_tier",
+                "Service Tier",
+                self.current_service_tier_id(),
+                vec![
+                    SessionConfigSelectOption::new("standard", "Standard")
+                        .description("Use the default response tier"),
+                    SessionConfigSelectOption::new("fast", "Fast")
+                        .description("Prefer the fast response tier"),
+                ],
+            )
+            .category(SessionConfigOptionCategory::Model)
+            .description("Choose the response service tier for this session"),
         );
 
         // Reasoning effort selector (only if the current preset exists and has >1 supported effort)
@@ -4346,6 +4377,7 @@ impl<A: Auth> ThreadActor<A> {
             "mode" => self.handle_set_mode(SessionModeId::new(value.0)).await,
             "collaboration_mode" => self.handle_set_collaboration_mode(value).await,
             "model" => self.handle_set_config_model(value).await,
+            "service_tier" => self.handle_set_config_service_tier(value).await,
             "reasoning_effort" => self.handle_set_config_reasoning_effort(value).await,
             _ => Err(Error::invalid_params().data("Unsupported config option")),
         }
@@ -4409,6 +4441,43 @@ impl<A: Auth> ThreadActor<A> {
         self.config.model = Some(next_mode.settings.model);
         self.config.model_reasoning_effort = next_mode.settings.reasoning_effort;
         self.config.developer_instructions = next_mode.settings.developer_instructions;
+    }
+
+    async fn set_service_tier(&mut self, service_tier: Option<ServiceTier>) -> Result<(), Error> {
+        self.thread
+            .submit(Op::OverrideTurnContext {
+                cwd: None,
+                approval_policy: None,
+                sandbox_policy: None,
+                model: None,
+                effort: None,
+                summary: None,
+                collaboration_mode: None,
+                personality: None,
+                windows_sandbox_level: None,
+                service_tier: Some(service_tier),
+                approvals_reviewer: None,
+                permission_profile: None,
+            })
+            .await
+            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+
+        self.config.service_tier = service_tier;
+
+        Ok(())
+    }
+
+    async fn handle_set_config_service_tier(
+        &mut self,
+        value: SessionConfigValueId,
+    ) -> Result<(), Error> {
+        let service_tier = match value.0.as_ref() {
+            "standard" => None,
+            "fast" => Some(ServiceTier::Fast),
+            _ => return Err(Error::invalid_params().data("Unsupported service tier")),
+        };
+
+        self.set_service_tier(service_tier).await
     }
 
     async fn handle_set_config_model(&mut self, value: SessionConfigValueId) -> Result<(), Error> {
@@ -4638,6 +4707,49 @@ impl<A: Auth> ThreadActor<A> {
                     "logout" => {
                         self.auth.logout().await?;
                         return Err(Error::auth_required());
+                    }
+                    "fast" => {
+                        let tier = match rest.trim().to_ascii_lowercase().as_str() {
+                            "" => {
+                                if matches!(self.config.service_tier, Some(ServiceTier::Fast)) {
+                                    None
+                                } else {
+                                    Some(ServiceTier::Fast)
+                                }
+                            }
+                            "on" => Some(ServiceTier::Fast),
+                            "off" => None,
+                            "status" => {
+                                let status =
+                                    if matches!(self.config.service_tier, Some(ServiceTier::Fast)) {
+                                        "on"
+                                    } else {
+                                        "off"
+                                    };
+                                self.client
+                                    .send_agent_text(format!("Fast mode is {status}.\n"));
+                                response_tx.send(Ok(StopReason::EndTurn)).ok();
+                                return Ok(response_rx);
+                            }
+                            _ => {
+                                self.client
+                                    .send_agent_text("Usage: /fast [on|off|status]\n".to_string());
+                                response_tx.send(Ok(StopReason::EndTurn)).ok();
+                                return Ok(response_rx);
+                            }
+                        };
+
+                        self.set_service_tier(tier).await?;
+                        self.maybe_emit_config_options_update().await;
+                        let status = if matches!(tier, Some(ServiceTier::Fast)) {
+                            "on"
+                        } else {
+                            "off"
+                        };
+                        self.client
+                            .send_agent_text(format!("Fast mode is {status}.\n"));
+                        response_tx.send(Ok(StopReason::EndTurn)).ok();
+                        return Ok(response_rx);
                     }
                     "rename" if !rest.is_empty() => {
                         let name = normalize_thread_name(rest).ok_or_else(Error::invalid_params)?;
