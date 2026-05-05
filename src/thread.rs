@@ -58,22 +58,23 @@ use codex_protocol::{
     protocol::{
         AgentMessageContentDeltaEvent, AgentMessageEvent, AgentReasoningEvent,
         AgentReasoningRawContentEvent, AgentReasoningSectionBreakEvent, AgentStatus,
-        ApplyPatchApprovalRequestEvent, CollabAgentInteractionBeginEvent,
+        ApplyPatchApprovalRequestEvent, BackgroundEventEvent, CollabAgentInteractionBeginEvent,
         CollabAgentInteractionEndEvent, CollabAgentSpawnBeginEvent, CollabAgentSpawnEndEvent,
         CollabCloseBeginEvent, CollabCloseEndEvent, CollabResumeBeginEvent, CollabResumeEndEvent,
-        CollabWaitingBeginEvent, CollabWaitingEndEvent, DynamicToolCallResponseEvent,
-        ElicitationAction, ErrorEvent, Event, EventMsg, ExecApprovalRequestEvent,
+        CollabWaitingBeginEvent, CollabWaitingEndEvent, DeprecationNoticeEvent,
+        DynamicToolCallResponseEvent, ElicitationAction, ErrorEvent, Event, EventMsg, ExecApprovalRequestEvent,
         ExecCommandBeginEvent, ExecCommandEndEvent, ExecCommandOutputDeltaEvent, ExecCommandStatus,
         ExitedReviewModeEvent, FileChange, GuardianAssessmentEvent, GuardianAssessmentStatus,
+        HookCompletedEvent, HookStartedEvent, ImageGenerationBeginEvent, ImageGenerationEndEvent,
         ItemCompletedEvent, ItemStartedEvent, ListSkillsResponseEvent, McpInvocation,
         McpStartupCompleteEvent, McpStartupUpdateEvent, McpToolCallBeginEvent, McpToolCallEndEvent,
         ModelRerouteEvent, NetworkApprovalContext, NetworkPolicyRuleAction, Op,
         PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus, PatchApplyUpdatedEvent,
-        RawResponseItemEvent, ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent,
+        PlanDeltaEvent, RawResponseItemEvent, ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent,
         ReviewDecision, ReviewOutputEvent, ReviewRequest, ReviewTarget, RolloutItem, SkillMetadata,
         SkillsListEntry, StreamErrorEvent, TerminalInteractionEvent, ThreadGoalStatus,
         ThreadGoalUpdatedEvent, TokenCountEvent, TurnAbortedEvent, TurnCompleteEvent,
-        TurnStartedEvent, UserMessageEvent, ViewImageToolCallEvent, WarningEvent,
+        ThreadRolledBackEvent, TurnStartedEvent, UserMessageEvent, ViewImageToolCallEvent, WarningEvent,
         WebSearchBeginEvent, WebSearchEndEvent,
     },
     request_permissions::{
@@ -1777,6 +1778,10 @@ impl PromptState {
                     client.send_agent_thought(text);
                 }
             }
+            EventMsg::AgentReasoningRawContent(AgentReasoningRawContentEvent { text }) => {
+                info!("Agent reasoning raw content received");
+                client.send_agent_thought(text);
+            }
             EventMsg::ThreadNameUpdated(event) => {
                 info!("Thread name updated: {:?}", event.thread_name);
                 send_session_title_update(client, event.thread_name);
@@ -1796,6 +1801,14 @@ impl PromptState {
                     self.saw_plan_output = true;
                 }
                 client.update_plan(plan);
+            }
+            EventMsg::PlanDelta(PlanDeltaEvent {
+                thread_id: _,
+                turn_id: _,
+                item_id: _,
+                delta,
+            }) => {
+                client.send_agent_thought(delta);
             }
             EventMsg::WebSearchBegin(WebSearchBeginEvent { call_id }) => {
                 info!("Web search started: call_id={}", call_id);
@@ -1978,6 +1991,58 @@ impl PromptState {
                 );
                 self.end_patch_apply(client, event);
             }
+            EventMsg::HookStarted(HookStartedEvent { turn_id: _, run }) => {
+                info!("Hook started: {} ({:?})", run.id, run.event_name);
+                client.send_agent_text(format!(
+                    "Running hook: {} ({:?})...\n",
+                    run.id, run.event_name
+                ));
+            }
+            EventMsg::HookCompleted(HookCompletedEvent { turn_id: _, run }) => {
+                let status_msg = run.status_message.as_deref().unwrap_or("");
+                info!(
+                    "Hook completed: {} ({:?}) {}",
+                    run.id, run.status, status_msg
+                );
+                client.send_agent_text(format!(
+                    "Hook completed: {} ({:?}){}\n",
+                    run.id,
+                    run.status,
+                    if status_msg.is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {status_msg}")
+                    }
+                ));
+            }
+            EventMsg::ImageGenerationBegin(ImageGenerationBeginEvent { call_id }) => {
+                info!("Image generation started: call_id={call_id}");
+                client.send_tool_call(
+                    ToolCall::new(call_id, "Generating image")
+                        .kind(ToolKind::Other)
+                        .status(ToolCallStatus::InProgress),
+                );
+            }
+            EventMsg::ImageGenerationEnd(ImageGenerationEndEvent {
+                call_id,
+                status,
+                revised_prompt: _,
+                result,
+                saved_path: _,
+            }) => {
+                info!("Image generation ended: call_id={call_id}, status={status}");
+                let tool_status = if status == "success" {
+                    ToolCallStatus::Completed
+                } else {
+                    ToolCallStatus::Failed
+                };
+                client.send_tool_call_update(ToolCallUpdate::new(
+                    call_id,
+                    ToolCallUpdateFields::new()
+                        .status(tool_status)
+                        .content(vec![result.into()]),
+                ));
+            }
             EventMsg::ItemCompleted(ItemCompletedEvent {
                 thread_id,
                 turn_id,
@@ -2122,6 +2187,26 @@ impl PromptState {
                 info!("Context compacted");
                 client.send_agent_text("Context compacted\n".to_string());
             }
+            EventMsg::ThreadRolledBack(ThreadRolledBackEvent { num_turns }) => {
+                info!("Thread rolled back: {num_turns} turns removed");
+                let suffix = if num_turns == 1 { "" } else { "s" };
+                client.send_agent_text(format!(
+                    "Thread rolled back: {num_turns} turn{suffix} removed from context.\n"
+                ));
+            }
+            EventMsg::BackgroundEvent(BackgroundEventEvent { message }) => {
+                info!("Background event: {message}");
+                client.send_agent_text(format!("{message}\n"));
+            }
+            EventMsg::DeprecationNotice(DeprecationNoticeEvent { summary, details }) => {
+                warn!("Deprecation notice: {summary}");
+                let message = if let Some(details) = details {
+                    format!("**Deprecation:** {summary}\n{details}\n")
+                } else {
+                    format!("**Deprecation:** {summary}\n")
+                };
+                client.send_agent_text(message);
+            }
             EventMsg::RequestPermissions(event) => {
                 info!("Request permissions: {} {}", event.call_id, event.turn_id);
                 if let Err(err) = self.request_permissions(client, event)
@@ -2155,16 +2240,7 @@ impl PromptState {
             }
 
             // Ignore these events
-            EventMsg::ImageGenerationBegin(..)
-            | EventMsg::ImageGenerationEnd(..)
-            | EventMsg::AgentReasoningRawContent(..)
-            | EventMsg::ThreadRolledBack(..)
-            | EventMsg::HookStarted(..)
-            | EventMsg::HookCompleted(..)
-            // we already have a way to diff the turn, so ignore
-            | EventMsg::TurnDiff(..)
-            // Revisit when we can emit status updates
-            | EventMsg::BackgroundEvent(..)
+            EventMsg::TurnDiff(..)
             | EventMsg::SkillsUpdateAvailable
             // Old events
             | EventMsg::AgentMessageDelta(..)
@@ -2173,14 +2249,12 @@ impl PromptState {
             | EventMsg::RealtimeConversationStarted(..)
             | EventMsg::RealtimeConversationRealtime(..)
             | EventMsg::RealtimeConversationClosed(..)
-            | EventMsg::RealtimeConversationSdp(..)
-            | EventMsg::PlanDelta(..)=> {}
+            | EventMsg::RealtimeConversationSdp(..)=> {}
             e @ (EventMsg::McpListToolsResponse(..)
             | EventMsg::ListSkillsResponse(..)
             | EventMsg::RealtimeConversationListVoicesResponse(..)
             // Used for returning a single history entry
-            | EventMsg::GetHistoryEntryResponse(..)
-            | EventMsg::DeprecationNotice(..)) => {
+            | EventMsg::GetHistoryEntryResponse(..)) => {
                 warn!("Unexpected event: {:?}", e);
             }
         }
