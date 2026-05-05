@@ -1073,7 +1073,7 @@ struct ActiveSubagent {
 struct PromptState {
     submission_id: String,
     active_commands: HashMap<String, ActiveCommand>,
-    active_web_search: Option<String>,
+    active_web_searches: HashSet<String>,
     active_guardian_assessments: HashSet<String>,
     active_subagents_by_call: HashMap<String, ActiveSubagent>,
     active_subagent_calls_by_thread: HashMap<String, ToolCallId>,
@@ -1166,7 +1166,7 @@ impl PromptState {
         Self {
             submission_id,
             active_commands: HashMap::new(),
-            active_web_search: None,
+            active_web_searches: HashSet::new(),
             active_guardian_assessments: HashSet::new(),
             active_subagents_by_call: HashMap::new(),
             active_subagent_calls_by_thread: HashMap::new(),
@@ -3216,7 +3216,7 @@ impl PromptState {
     }
 
     fn start_web_search(&mut self, client: &SessionClient, call_id: String) {
-        self.active_web_search = Some(call_id.clone());
+        self.active_web_searches.insert(call_id.clone());
         client.send_tool_call(ToolCall::new(call_id, "Searching the Web").kind(ToolKind::Fetch));
     }
 
@@ -3259,7 +3259,7 @@ impl PromptState {
     }
 
     fn complete_web_search(&mut self, client: &SessionClient) {
-        if let Some(call_id) = self.active_web_search.take() {
+        for call_id in self.active_web_searches.drain().collect::<Vec<_>>() {
             client.send_tool_call_update(ToolCallUpdate::new(
                 call_id,
                 ToolCallUpdateFields::new().status(ToolCallStatus::Completed),
