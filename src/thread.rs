@@ -67,10 +67,11 @@ use codex_protocol::{
         ExecCommandOutputDeltaEvent, ExecCommandStatus, ExitedReviewModeEvent, FileChange,
         GuardianAssessmentEvent, GuardianAssessmentStatus, HookCompletedEvent, HookStartedEvent,
         ImageGenerationBeginEvent, ImageGenerationEndEvent, ItemCompletedEvent, ItemStartedEvent,
-        ListSkillsResponseEvent, McpInvocation, McpStartupCompleteEvent, McpStartupUpdateEvent,
-        McpToolCallBeginEvent, McpToolCallEndEvent, ModelRerouteEvent, NetworkApprovalContext,
-        NetworkPolicyRuleAction, Op, PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus,
-        PatchApplyUpdatedEvent, PlanDeltaEvent, RawResponseItemEvent, ReasoningContentDeltaEvent,
+        ListSkillsResponseEvent, McpInvocation, McpStartupCompleteEvent, McpStartupStatus,
+        McpStartupUpdateEvent, McpToolCallBeginEvent, McpToolCallEndEvent, ModelRerouteEvent,
+        ModelVerification, ModelVerificationEvent, NetworkApprovalContext, NetworkPolicyRuleAction,
+        Op, PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus, PatchApplyUpdatedEvent,
+        PlanDeltaEvent, RawResponseItemEvent, ReasoningContentDeltaEvent,
         ReasoningRawContentDeltaEvent, ReviewDecision, ReviewOutputEvent, ReviewRequest,
         ReviewTarget, RolloutItem, SkillMetadata, SkillsListEntry, StreamErrorEvent,
         TerminalInteractionEvent, ThreadGoalStatus, ThreadGoalUpdatedEvent, ThreadRolledBackEvent,
@@ -552,6 +553,54 @@ fn format_thread_goal_update(event: &ThreadGoalUpdatedEvent) -> String {
     } else {
         format!("Goal updated ({status}): {objective}")
     }
+}
+
+fn format_model_verification(event: &ModelVerificationEvent) -> String {
+    if event.verifications.is_empty() {
+        return "Codex requires additional model verification.\n".to_string();
+    }
+
+    let verifications = event
+        .verifications
+        .iter()
+        .map(|verification| match verification {
+            ModelVerification::TrustedAccessForCyber => "trusted access for cyber",
+        })
+        .join(", ");
+
+    format!("Codex requires additional model verification: {verifications}.\n")
+}
+
+fn format_mcp_startup_status(status: &McpStartupStatus) -> String {
+    match status {
+        McpStartupStatus::Starting => "starting".to_string(),
+        McpStartupStatus::Ready => "ready".to_string(),
+        McpStartupStatus::Failed { error } => format!("failed: {error}"),
+        McpStartupStatus::Cancelled => "cancelled".to_string(),
+    }
+}
+
+fn format_mcp_startup_complete(
+    ready: &[String],
+    failed: &[codex_protocol::protocol::McpStartupFailure],
+    cancelled: &[String],
+) -> Option<String> {
+    if failed.is_empty() && cancelled.is_empty() {
+        return None;
+    }
+
+    let mut lines = Vec::new();
+    lines.push("MCP startup completed with issues:".to_string());
+    if !ready.is_empty() {
+        lines.push(format!("Ready: {}", ready.iter().join(", ")));
+    }
+    for failure in failed {
+        lines.push(format!("Failed: {} - {}", failure.server, failure.error));
+    }
+    if !cancelled.is_empty() {
+        lines.push(format!("Cancelled: {}", cancelled.iter().join(", ")));
+    }
+    Some(format!("{}\n", lines.join("\n")))
 }
 
 #[expect(clippy::large_enum_variant)]
@@ -1882,6 +1931,15 @@ impl PromptState {
             }
             EventMsg::McpStartupUpdate(McpStartupUpdateEvent { server, status }) => {
                 info!("MCP startup update: server={server}, status={status:?}");
+                if matches!(
+                    status,
+                    McpStartupStatus::Failed { .. } | McpStartupStatus::Cancelled
+                ) {
+                    client.send_agent_text(format!(
+                        "MCP server `{server}` startup {}.\n",
+                        format_mcp_startup_status(&status)
+                    ));
+                }
             }
             EventMsg::McpStartupComplete(McpStartupCompleteEvent {
                 ready,
@@ -1891,6 +1949,9 @@ impl PromptState {
                 info!(
                     "MCP startup complete: ready={ready:?}, failed={failed:?}, cancelled={cancelled:?}"
                 );
+                if let Some(message) = format_mcp_startup_complete(&ready, &failed, &cancelled) {
+                    client.send_agent_text(message);
+                }
             }
             EventMsg::ElicitationRequest(event) => {
                 info!("Elicitation request: server={}, id={:?}", event.server_name, event.id);
@@ -1905,6 +1966,7 @@ impl PromptState {
             }
             EventMsg::ModelVerification(event) => {
                 info!("Model verification requested: {event:?}");
+                client.send_agent_text(format_model_verification(&event));
             }
 
             EventMsg::ContextCompacted(..) => {
@@ -4219,6 +4281,25 @@ impl<A: Auth> ThreadActor<A> {
                         return Ok(response_rx);
                     }
                     "stop" => op = Op::CleanBackgroundTerminals,
+                    "mention" if !rest.is_empty() => {
+                        op = Op::UserInput {
+                            items: vec![UserInput::Text {
+                                text: format!("@{}", rest.trim()),
+                                text_elements: vec![],
+                            }],
+                            final_output_json_schema: None,
+                            environments: None,
+                            responsesapi_client_metadata: None,
+                        };
+                    }
+                    "feedback" => {
+                        self.client.send_agent_text(
+                            "Feedback collection is not available through generic ACP. Please use the host client or project issue tracker.\n"
+                                .to_string(),
+                        );
+                        response_tx.send(Ok(StopReason::EndTurn)).ok();
+                        return Ok(response_rx);
+                    }
                     "mcp" => {
                         self.client.send_agent_text(self.format_mcp_servers());
                         response_tx.send(Ok(StopReason::EndTurn)).ok();
@@ -4226,6 +4307,14 @@ impl<A: Auth> ThreadActor<A> {
                     }
                     "skills" => {
                         self.client.send_agent_text(format_skills(&self.skills));
+                        response_tx.send(Ok(StopReason::EndTurn)).ok();
+                        return Ok(response_rx);
+                    }
+                    "debug-config" => {
+                        let mut output = self.format_session_status().await;
+                        output.push('\n');
+                        output.push_str(&self.format_mcp_servers());
+                        self.client.send_agent_text(output);
                         response_tx.send(Ok(StopReason::EndTurn)).ok();
                         return Ok(response_rx);
                     }

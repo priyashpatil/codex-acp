@@ -74,6 +74,104 @@ async fn test_thread_goal_updated_is_sent_as_agent_message() -> anyhow::Result<(
 }
 
 #[tokio::test]
+async fn test_model_verification_and_lifecycle_events_are_visible() -> anyhow::Result<()> {
+    let (session_id, client, _, message_tx, _handle) = setup().await?;
+    let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+    message_tx.send(ThreadMessage::Prompt {
+        request: PromptRequest::new(session_id.clone(), vec!["lifecycle-events".into()]),
+        response_tx: prompt_response_tx,
+    })?;
+
+    let stop_reason = prompt_response_rx.await??.await??;
+    assert_eq!(stop_reason, StopReason::EndTurn);
+    drop(message_tx);
+
+    let text = client
+        .agent_text_notifications()
+        .into_iter()
+        .map(|chunk| chunk.to_string())
+        .join("\n");
+    assert!(text.contains("Running hook: hook-a"));
+    assert!(text.contains("Hook completed: hook-a"));
+    assert!(text.contains("Background task completed"));
+    assert!(text.contains("**Deprecation:** Old setting"));
+    assert!(text.contains("Thread rolled back: 2 turns removed"));
+    assert!(text.contains("trusted access for cyber"));
+    assert!(text.contains("MCP server `docs` startup failed: boom."));
+    assert!(text.contains("MCP startup completed with issues:"));
+
+    let notifications = client.notifications.lock().unwrap();
+    assert!(notifications.iter().any(|notification| {
+        matches!(
+            &notification.update,
+            SessionUpdate::ToolCall(tool_call)
+                if tool_call.title == "Generating image"
+                    && tool_call.status == ToolCallStatus::InProgress
+        )
+    }));
+    assert!(notifications.iter().any(|notification| {
+        matches!(
+            &notification.update,
+            SessionUpdate::ToolCallUpdate(update)
+                if update.tool_call_id.0.as_ref() == "image-a"
+                    && update.fields.status == Some(ToolCallStatus::Completed)
+        )
+    }));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_orphaned_exec_events_do_not_panic() -> anyhow::Result<()> {
+    let (session_id, _client, _, message_tx, _handle) = setup().await?;
+    let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+    message_tx.send(ThreadMessage::Prompt {
+        request: PromptRequest::new(session_id.clone(), vec!["orphaned-exec-events".into()]),
+        response_tx: prompt_response_tx,
+    })?;
+
+    let stop_reason = prompt_response_rx.await??.await??;
+    assert_eq!(stop_reason, StopReason::EndTurn);
+    drop(message_tx);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_usage_update_edge_cases() -> anyhow::Result<()> {
+    let (session_id, client, _, message_tx, _handle) = setup().await?;
+    let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+    message_tx.send(ThreadMessage::Prompt {
+        request: PromptRequest::new(session_id.clone(), vec!["usage-events".into()]),
+        response_tx: prompt_response_tx,
+    })?;
+
+    let stop_reason = prompt_response_rx.await??.await??;
+    assert_eq!(stop_reason, StopReason::EndTurn);
+    drop(message_tx);
+
+    let notifications = client.notifications.lock().unwrap();
+    let usage_updates = notifications
+        .iter()
+        .filter_map(|notification| match &notification.update {
+            SessionUpdate::UsageUpdate(update) => Some(update),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(usage_updates.len(), 2);
+    assert_eq!(usage_updates[0].size, 200);
+    assert_eq!(usage_updates[0].used, 25);
+    assert!(usage_updates[0].cost.is_some());
+    assert_eq!(usage_updates[1].used, 50);
+    assert!(usage_updates[1].cost.is_none());
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_compact() -> anyhow::Result<()> {
     let (session_id, client, thread, message_tx, _handle) = setup().await?;
     let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
@@ -160,6 +258,87 @@ async fn test_replay_thread_name_sends_title_update() -> anyhow::Result<()> {
                 if update.title.value() == Some(&"Persisted Thread Name".to_string())
         )
     }));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_builtin_commands_include_debug_feedback_and_mention() -> anyhow::Result<()> {
+    let (_session_id, client, _, message_tx, _handle) = setup().await?;
+    let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+
+    message_tx.send(ThreadMessage::Load { response_tx })?;
+    response_rx.await??;
+    drop(message_tx);
+
+    let notifications = client.notifications.lock().unwrap();
+    let available = notifications
+        .iter()
+        .find_map(|notification| match &notification.update {
+            SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate {
+                available_commands,
+                ..
+            }) => Some(available_commands),
+            _ => None,
+        });
+    let Some(available) = available else {
+        anyhow::bail!("expected available command update");
+    };
+    for command in ["mention", "feedback", "debug-config"] {
+        assert!(
+            available.iter().any(|available| available.name == command),
+            "missing /{command}"
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_mention_command_submits_file_reference() -> anyhow::Result<()> {
+    let (session_id, _client, thread, message_tx, _handle) = setup().await?;
+    let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+    message_tx.send(ThreadMessage::Prompt {
+        request: PromptRequest::new(session_id.clone(), vec!["/mention src/lib.rs".into()]),
+        response_tx: prompt_response_tx,
+    })?;
+
+    let stop_reason = prompt_response_rx.await??.await??;
+    assert_eq!(stop_reason, StopReason::EndTurn);
+    drop(message_tx);
+
+    let ops = thread.ops.lock().unwrap();
+    assert!(matches!(
+        ops.as_slice(),
+        [Op::UserInput { items, .. }]
+            if matches!(
+                items.as_slice(),
+                [UserInput::Text { text, .. }] if text == "@src/lib.rs"
+            )
+    ));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_feedback_and_debug_config_commands_are_generic() -> anyhow::Result<()> {
+    let (session_id, client, _, message_tx, _handle) = setup().await?;
+
+    for command in ["/feedback", "/debug-config"] {
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec![command.into()]),
+            response_tx: prompt_response_tx,
+        })?;
+        let stop_reason = prompt_response_rx.await??.await??;
+        assert_eq!(stop_reason, StopReason::EndTurn);
+    }
+    drop(message_tx);
+
+    let text = client.agent_text_notifications().join("\n");
+    assert!(text.contains("Feedback collection is not available through generic ACP"));
+    assert!(text.contains("## Session Status"));
 
     Ok(())
 }
@@ -1733,6 +1912,205 @@ impl CodexThreadImpl for StubCodexThread {
                             duration_ms: None,
                             time_to_first_token_ms: None,
                         }));
+                    } else if prompt == "lifecycle-events" {
+                        let turn_id = id.to_string();
+                        let source_path = std::env::current_dir()?.try_into()?;
+                        let hook_run = codex_protocol::protocol::HookRunSummary {
+                            id: "hook-a".to_string(),
+                            event_name: codex_protocol::protocol::HookEventName::PostToolUse,
+                            handler_type: codex_protocol::protocol::HookHandlerType::Command,
+                            execution_mode: codex_protocol::protocol::HookExecutionMode::Sync,
+                            scope: codex_protocol::protocol::HookScope::Turn,
+                            source_path,
+                            source: codex_protocol::protocol::HookSource::User,
+                            display_order: 0,
+                            status: codex_protocol::protocol::HookRunStatus::Completed,
+                            status_message: Some("ok".to_string()),
+                            started_at: 1,
+                            completed_at: Some(2),
+                            duration_ms: Some(1),
+                            entries: Vec::new(),
+                        };
+                        let send = |msg| {
+                            self.op_tx
+                                .send(Event {
+                                    id: id.to_string(),
+                                    msg,
+                                })
+                                .unwrap();
+                        };
+                        send(EventMsg::HookStarted(HookStartedEvent {
+                            turn_id: Some(turn_id.clone()),
+                            run: hook_run.clone(),
+                        }));
+                        send(EventMsg::HookCompleted(HookCompletedEvent {
+                            turn_id: Some(turn_id.clone()),
+                            run: hook_run,
+                        }));
+                        send(EventMsg::ImageGenerationBegin(ImageGenerationBeginEvent {
+                            call_id: "image-a".to_string(),
+                        }));
+                        send(EventMsg::ImageGenerationEnd(ImageGenerationEndEvent {
+                            call_id: "image-a".to_string(),
+                            status: "success".to_string(),
+                            revised_prompt: None,
+                            result: "image saved".to_string(),
+                            saved_path: None,
+                        }));
+                        send(EventMsg::BackgroundEvent(BackgroundEventEvent {
+                            message: "Background task completed".to_string(),
+                        }));
+                        send(EventMsg::DeprecationNotice(DeprecationNoticeEvent {
+                            summary: "Old setting".to_string(),
+                            details: Some("Use the new setting.".to_string()),
+                        }));
+                        send(EventMsg::ThreadRolledBack(ThreadRolledBackEvent {
+                            num_turns: 2,
+                        }));
+                        send(EventMsg::ModelVerification(ModelVerificationEvent {
+                            verifications: vec![ModelVerification::TrustedAccessForCyber],
+                        }));
+                        send(EventMsg::McpStartupUpdate(McpStartupUpdateEvent {
+                            server: "docs".to_string(),
+                            status: McpStartupStatus::Failed {
+                                error: "boom".to_string(),
+                            },
+                        }));
+                        send(EventMsg::McpStartupComplete(McpStartupCompleteEvent {
+                            ready: vec!["fs".to_string()],
+                            failed: vec![codex_protocol::protocol::McpStartupFailure {
+                                server: "docs".to_string(),
+                                error: "boom".to_string(),
+                            }],
+                            cancelled: vec!["calendar".to_string()],
+                        }));
+                        send(EventMsg::TurnComplete(TurnCompleteEvent {
+                            last_agent_message: None,
+                            turn_id,
+                            completed_at: None,
+                            duration_ms: None,
+                            time_to_first_token_ms: None,
+                        }));
+                    } else if prompt == "orphaned-exec-events" {
+                        let turn_id = id.to_string();
+                        let cwd = std::env::current_dir().unwrap();
+                        let send = |msg| {
+                            self.op_tx
+                                .send(Event {
+                                    id: id.to_string(),
+                                    msg,
+                                })
+                                .unwrap();
+                        };
+                        send(EventMsg::ExecCommandOutputDelta(
+                            ExecCommandOutputDeltaEvent {
+                                call_id: "missing".to_string(),
+                                stream: codex_protocol::protocol::ExecOutputStream::Stdout,
+                                chunk: b"hello".to_vec(),
+                            },
+                        ));
+                        send(EventMsg::TerminalInteraction(TerminalInteractionEvent {
+                            call_id: "missing".to_string(),
+                            process_id: "123".to_string(),
+                            stdin: "input".to_string(),
+                        }));
+                        send(EventMsg::ExecCommandEnd(ExecCommandEndEvent {
+                            call_id: "missing".to_string(),
+                            process_id: None,
+                            turn_id: turn_id.clone(),
+                            command: vec!["echo".into(), "missing".into()],
+                            cwd: cwd.try_into()?,
+                            parsed_cmd: vec![],
+                            source: Default::default(),
+                            interaction_input: None,
+                            stdout: "hello".into(),
+                            stderr: String::new(),
+                            aggregated_output: "hello".into(),
+                            exit_code: 0,
+                            duration: std::time::Duration::from_millis(10),
+                            formatted_output: "hello".into(),
+                            status: ExecCommandStatus::Completed,
+                        }));
+                        send(EventMsg::TurnComplete(TurnCompleteEvent {
+                            last_agent_message: None,
+                            turn_id,
+                            completed_at: None,
+                            duration_ms: None,
+                            time_to_first_token_ms: None,
+                        }));
+                    } else if prompt == "usage-events" {
+                        let turn_id = id.to_string();
+                        let send = |msg| {
+                            self.op_tx
+                                .send(Event {
+                                    id: id.to_string(),
+                                    msg,
+                                })
+                                .unwrap();
+                        };
+                        send(EventMsg::TokenCount(TokenCountEvent {
+                            info: None,
+                            rate_limits: None,
+                        }));
+                        send(EventMsg::TokenCount(TokenCountEvent {
+                            info: Some(codex_protocol::protocol::TokenUsageInfo {
+                                total_token_usage: codex_protocol::protocol::TokenUsage {
+                                    total_tokens: 25,
+                                    ..Default::default()
+                                },
+                                last_token_usage: codex_protocol::protocol::TokenUsage {
+                                    total_tokens: 25,
+                                    ..Default::default()
+                                },
+                                model_context_window: Some(200),
+                            }),
+                            rate_limits: Some(codex_protocol::protocol::RateLimitSnapshot {
+                                limit_id: None,
+                                limit_name: None,
+                                primary: None,
+                                secondary: None,
+                                credits: Some(codex_protocol::protocol::CreditsSnapshot {
+                                    has_credits: true,
+                                    unlimited: false,
+                                    balance: Some("1.25".to_string()),
+                                }),
+                                plan_type: None,
+                                rate_limit_reached_type: None,
+                            }),
+                        }));
+                        send(EventMsg::TokenCount(TokenCountEvent {
+                            info: Some(codex_protocol::protocol::TokenUsageInfo {
+                                total_token_usage: codex_protocol::protocol::TokenUsage {
+                                    total_tokens: 50,
+                                    ..Default::default()
+                                },
+                                last_token_usage: codex_protocol::protocol::TokenUsage {
+                                    total_tokens: 25,
+                                    ..Default::default()
+                                },
+                                model_context_window: Some(200),
+                            }),
+                            rate_limits: Some(codex_protocol::protocol::RateLimitSnapshot {
+                                limit_id: None,
+                                limit_name: None,
+                                primary: None,
+                                secondary: None,
+                                credits: Some(codex_protocol::protocol::CreditsSnapshot {
+                                    has_credits: true,
+                                    unlimited: false,
+                                    balance: Some("not-a-number".to_string()),
+                                }),
+                                plan_type: None,
+                                rate_limit_reached_type: None,
+                            }),
+                        }));
+                        send(EventMsg::TurnComplete(TurnCompleteEvent {
+                            last_agent_message: None,
+                            turn_id,
+                            completed_at: None,
+                            duration_ms: None,
+                            time_to_first_token_ms: None,
+                        }));
                     } else {
                         self.op_tx
                             .send(Event {
@@ -1975,6 +2353,21 @@ impl StubClient {
             permission_responses: std::sync::Mutex::new(responses.into()),
             block_permission_requests: Some(notify),
         }
+    }
+
+    fn agent_text_notifications(&self) -> Vec<String> {
+        self.notifications
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|notification| match &notification.update {
+                SessionUpdate::AgentMessageChunk(ContentChunk {
+                    content: ContentBlock::Text(TextContent { text, .. }),
+                    ..
+                }) => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
     }
 }
 

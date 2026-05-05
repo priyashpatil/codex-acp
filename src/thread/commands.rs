@@ -47,8 +47,16 @@ pub(super) fn builtin_commands() -> Vec<AvailableCommand> {
             "show current session configuration and token usage",
         ),
         AvailableCommand::new("stop", "stop all background terminals"),
+        AvailableCommand::new("mention", "send a file mention to Codex").input(
+            AvailableCommandInput::Unstructured(UnstructuredCommandInput::new("file path")),
+        ),
+        AvailableCommand::new("feedback", "show feedback guidance for this ACP agent"),
         AvailableCommand::new("mcp", "list configured MCP servers"),
         AvailableCommand::new("skills", "list available Codex skills"),
+        AvailableCommand::new(
+            "debug-config",
+            "show session configuration details for debugging",
+        ),
     ]
 }
 
