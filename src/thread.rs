@@ -26,7 +26,7 @@ use agent_client_protocol::{
 use codex_apply_patch::parse_patch;
 use codex_core::{
     CodexThread,
-    config::{Config, set_project_trust_level},
+    config::{Config, edit::ConfigEditsBuilder, set_project_trust_level},
     review_format::format_review_findings_block,
     review_prompts::user_facing_hint,
     util::normalize_thread_name,
@@ -4463,8 +4463,41 @@ impl<A: Auth> ThreadActor<A> {
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
 
         self.config.service_tier = service_tier;
+        self.persist_service_tier_default(service_tier).await?;
 
         Ok(())
+    }
+
+    async fn persist_service_tier_default(
+        &self,
+        service_tier: Option<ServiceTier>,
+    ) -> Result<(), Error> {
+        ConfigEditsBuilder::new(&self.config.codex_home)
+            .with_profile(self.config.active_profile.as_deref())
+            .set_service_tier(service_tier)
+            .apply()
+            .await
+            .map_err(|e| {
+                Error::internal_error().data(format!(
+                    "Updated session, but failed to persist service tier: {e}"
+                ))
+            })
+    }
+
+    async fn persist_model_default(
+        &self,
+        model: &str,
+        effort: Option<ReasoningEffort>,
+    ) -> Result<(), Error> {
+        ConfigEditsBuilder::new(&self.config.codex_home)
+            .with_profile(self.config.active_profile.as_deref())
+            .set_model(Some(model), effort)
+            .apply()
+            .await
+            .map_err(|e| {
+                Error::internal_error()
+                    .data(format!("Updated session, but failed to persist model: {e}"))
+            })
     }
 
     async fn handle_set_config_service_tier(
@@ -4531,6 +4564,11 @@ impl<A: Auth> ThreadActor<A> {
 
         self.config.model = Some(model_to_use);
         self.config.model_reasoning_effort = effort_to_use;
+        self.persist_model_default(
+            self.config.model.as_deref().unwrap_or_default(),
+            self.config.model_reasoning_effort,
+        )
+        .await?;
 
         Ok(())
     }
@@ -4578,6 +4616,9 @@ impl<A: Auth> ThreadActor<A> {
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
 
         self.config.model_reasoning_effort = Some(effort);
+        let current_model = self.get_current_model().await;
+        self.persist_model_default(&current_model, self.config.model_reasoning_effort)
+            .await?;
 
         Ok(())
     }
