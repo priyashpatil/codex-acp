@@ -4,9 +4,9 @@ use acp::schema::{
     ClientCapabilities, CloseSessionRequest, CloseSessionResponse, ForkSessionRequest,
     ForkSessionResponse, Implementation, InitializeRequest, InitializeResponse,
     ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
-    LogoutCapabilities, LogoutRequest, LogoutResponse, McpCapabilities, McpServer,
-    McpServerHttp, McpServerStdio, NewSessionRequest, NewSessionResponse, PromptCapabilities,
-    PromptRequest, PromptResponse, ProtocolVersion, SessionCapabilities, SessionCloseCapabilities,
+    LogoutCapabilities, LogoutRequest, LogoutResponse, McpCapabilities, McpServer, McpServerHttp,
+    McpServerStdio, NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest,
+    PromptResponse, ProtocolVersion, SessionCapabilities, SessionCloseCapabilities,
     SessionForkCapabilities, SessionId, SessionInfo, SessionListCapabilities,
     SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
     SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse,
@@ -695,10 +695,13 @@ impl CodexAgent {
         } = request;
         info!("Forking session: {}", session_id);
 
-        let rollout_path = find_thread_path_by_id_str(&self.config.codex_home, session_id.0.as_ref())
-            .await
-            .map_err(|e| Error::internal_error().data(e.to_string()))?
-            .ok_or_else(|| Error::resource_not_found(Some(format!("session not found: {session_id}"))))?;
+        let rollout_path =
+            find_thread_path_by_id_str(&self.config.codex_home, session_id.0.as_ref())
+                .await
+                .map_err(|e| Error::internal_error().data(e.to_string()))?
+                .ok_or_else(|| {
+                    Error::resource_not_found(Some(format!("session not found: {session_id}")))
+                })?;
 
         let config = self.build_session_config(&cwd, mcp_servers)?;
 

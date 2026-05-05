@@ -62,20 +62,20 @@ use codex_protocol::{
         CollabAgentInteractionEndEvent, CollabAgentSpawnBeginEvent, CollabAgentSpawnEndEvent,
         CollabCloseBeginEvent, CollabCloseEndEvent, CollabResumeBeginEvent, CollabResumeEndEvent,
         CollabWaitingBeginEvent, CollabWaitingEndEvent, DeprecationNoticeEvent,
-        DynamicToolCallResponseEvent, ElicitationAction, ErrorEvent, Event, EventMsg, ExecApprovalRequestEvent,
-        ExecCommandBeginEvent, ExecCommandEndEvent, ExecCommandOutputDeltaEvent, ExecCommandStatus,
-        ExitedReviewModeEvent, FileChange, GuardianAssessmentEvent, GuardianAssessmentStatus,
-        HookCompletedEvent, HookStartedEvent, ImageGenerationBeginEvent, ImageGenerationEndEvent,
-        ItemCompletedEvent, ItemStartedEvent, ListSkillsResponseEvent, McpInvocation,
-        McpStartupCompleteEvent, McpStartupUpdateEvent, McpToolCallBeginEvent, McpToolCallEndEvent,
-        ModelRerouteEvent, NetworkApprovalContext, NetworkPolicyRuleAction, Op,
-        PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus, PatchApplyUpdatedEvent,
-        PlanDeltaEvent, RawResponseItemEvent, ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent,
-        ReviewDecision, ReviewOutputEvent, ReviewRequest, ReviewTarget, RolloutItem, SkillMetadata,
-        SkillsListEntry, StreamErrorEvent, TerminalInteractionEvent, ThreadGoalStatus,
-        ThreadGoalUpdatedEvent, TokenCountEvent, TurnAbortedEvent, TurnCompleteEvent,
-        ThreadRolledBackEvent, TurnStartedEvent, UserMessageEvent, ViewImageToolCallEvent, WarningEvent,
-        WebSearchBeginEvent, WebSearchEndEvent,
+        DynamicToolCallResponseEvent, ElicitationAction, ErrorEvent, Event, EventMsg,
+        ExecApprovalRequestEvent, ExecCommandBeginEvent, ExecCommandEndEvent,
+        ExecCommandOutputDeltaEvent, ExecCommandStatus, ExitedReviewModeEvent, FileChange,
+        GuardianAssessmentEvent, GuardianAssessmentStatus, HookCompletedEvent, HookStartedEvent,
+        ImageGenerationBeginEvent, ImageGenerationEndEvent, ItemCompletedEvent, ItemStartedEvent,
+        ListSkillsResponseEvent, McpInvocation, McpStartupCompleteEvent, McpStartupUpdateEvent,
+        McpToolCallBeginEvent, McpToolCallEndEvent, ModelRerouteEvent, NetworkApprovalContext,
+        NetworkPolicyRuleAction, Op, PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus,
+        PatchApplyUpdatedEvent, PlanDeltaEvent, RawResponseItemEvent, ReasoningContentDeltaEvent,
+        ReasoningRawContentDeltaEvent, ReviewDecision, ReviewOutputEvent, ReviewRequest,
+        ReviewTarget, RolloutItem, SkillMetadata, SkillsListEntry, StreamErrorEvent,
+        TerminalInteractionEvent, ThreadGoalStatus, ThreadGoalUpdatedEvent, ThreadRolledBackEvent,
+        TokenCountEvent, TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent, UserMessageEvent,
+        ViewImageToolCallEvent, WarningEvent, WebSearchBeginEvent, WebSearchEndEvent,
     },
     request_permissions::{
         PermissionGrantScope, RequestPermissionProfile, RequestPermissionsEvent,
@@ -1289,11 +1289,9 @@ impl PromptState {
         for call_id in self.active_context_compactions.drain().collect::<Vec<_>>() {
             client.send_tool_call_update(ToolCallUpdate::new(
                 call_id,
-                ToolCallUpdateFields::new()
-                    .status(status)
-                    .content(vec![
-                        context_compaction_status_text(status).to_string().into(),
-                    ]),
+                ToolCallUpdateFields::new().status(status).content(vec![
+                    context_compaction_status_text(status).to_string().into(),
+                ]),
             ));
         }
     }
@@ -4735,7 +4733,11 @@ impl<A: Auth> ThreadActor<A> {
                     format!("http: {url}")
                 }
             };
-            let state = if server.enabled { "enabled" } else { "disabled" };
+            let state = if server.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            };
             output.push_str(&format!("- `{name}` ({state}) - {transport}\n"));
         }
         output
@@ -4747,7 +4749,11 @@ impl<A: Auth> ThreadActor<A> {
         }
 
         let mut output = String::from("## Codex Skills\n\n");
-        for skill in self.skills.iter().sorted_by_key(|skill| skill.name.as_str()) {
+        for skill in self
+            .skills
+            .iter()
+            .sorted_by_key(|skill| skill.name.as_str())
+        {
             let state = if skill.enabled { "enabled" } else { "disabled" };
             output.push_str(&format!(
                 "- `{}` ({state}) - {}\n",
@@ -5051,12 +5057,14 @@ impl<A: Auth> ThreadActor<A> {
                             "on" => Some(ServiceTier::Fast),
                             "off" => None,
                             "status" => {
-                                let status =
-                                    if matches!(self.config.service_tier, Some(ServiceTier::Fast)) {
-                                        "on"
-                                    } else {
-                                        "off"
-                                    };
+                                let status = if matches!(
+                                    self.config.service_tier,
+                                    Some(ServiceTier::Fast)
+                                ) {
+                                    "on"
+                                } else {
+                                    "off"
+                                };
                                 self.client
                                     .send_agent_text(format!("Fast mode is {status}.\n"));
                                 response_tx.send(Ok(StopReason::EndTurn)).ok();
