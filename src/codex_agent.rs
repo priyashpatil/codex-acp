@@ -1,12 +1,13 @@
 use acp::schema::{
     AgentAuthCapabilities, AgentCapabilities, AuthEnvVar, AuthMethod, AuthMethodAgent,
     AuthMethodEnvVar, AuthMethodId, AuthenticateRequest, AuthenticateResponse, CancelNotification,
-    ClientCapabilities, CloseSessionRequest, CloseSessionResponse, Implementation,
-    InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
-    LoadSessionRequest, LoadSessionResponse, LogoutCapabilities, LogoutRequest, LogoutResponse,
-    McpCapabilities, McpServer, McpServerHttp, McpServerStdio, NewSessionRequest,
-    NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse, ProtocolVersion,
-    SessionCapabilities, SessionCloseCapabilities, SessionId, SessionInfo, SessionListCapabilities,
+    ClientCapabilities, CloseSessionRequest, CloseSessionResponse, ForkSessionRequest,
+    ForkSessionResponse, Implementation, InitializeRequest, InitializeResponse,
+    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
+    LogoutCapabilities, LogoutRequest, LogoutResponse, McpCapabilities, McpServer,
+    McpServerHttp, McpServerStdio, NewSessionRequest, NewSessionResponse, PromptCapabilities,
+    PromptRequest, PromptResponse, ProtocolVersion, SessionCapabilities, SessionCloseCapabilities,
+    SessionForkCapabilities, SessionId, SessionInfo, SessionListCapabilities,
     SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
     SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse,
 };
@@ -167,6 +168,21 @@ impl CodexAgent {
                         cx.spawn(async move {
                             responder
                                 .respond_with_result(agent.load_session(request, session_cx).await)
+                        })?;
+                        Ok(())
+                    }
+                },
+                acp::on_receive_request!(),
+            )
+            .on_receive_request(
+                {
+                    let agent = agent.clone();
+                    async move |request: ForkSessionRequest, responder, cx: ConnectionTo<Client>| {
+                        let agent = agent.clone();
+                        let session_cx = cx.clone();
+                        cx.spawn(async move {
+                            responder
+                                .respond_with_result(agent.fork_session(request, session_cx).await)
                         })?;
                         Ok(())
                     }
@@ -432,7 +448,8 @@ impl CodexAgent {
 
         agent_capabilities.session_capabilities = SessionCapabilities::new()
             .close(SessionCloseCapabilities::new())
-            .list(SessionListCapabilities::new());
+            .list(SessionListCapabilities::new())
+            .fork(SessionForkCapabilities::new());
 
         let mut auth_methods = vec![
             CodexAuthMethod::ChatGpt.into(),
@@ -658,6 +675,71 @@ impl CodexAgent {
         self.sessions.lock().unwrap().insert(session_id, thread);
 
         Ok(LoadSessionResponse::new()
+            .modes(load.modes)
+            .models(load.models)
+            .config_options(load.config_options))
+    }
+
+    async fn fork_session(
+        &self,
+        request: ForkSessionRequest,
+        cx: ConnectionTo<Client>,
+    ) -> Result<ForkSessionResponse, Error> {
+        self.check_auth().await?;
+
+        let ForkSessionRequest {
+            session_id,
+            cwd,
+            mcp_servers,
+            ..
+        } = request;
+        info!("Forking session: {}", session_id);
+
+        let rollout_path = find_thread_path_by_id_str(&self.config.codex_home, session_id.0.as_ref())
+            .await
+            .map_err(|e| Error::internal_error().data(e.to_string()))?
+            .ok_or_else(|| Error::resource_not_found(Some(format!("session not found: {session_id}"))))?;
+
+        let config = self.build_session_config(&cwd, mcp_servers)?;
+
+        let NewThread {
+            thread_id,
+            thread,
+            session_configured: _,
+        } = Box::pin(self.thread_manager.fork_thread(
+            usize::MAX,
+            config.clone(),
+            thread_store_from_config(&config),
+            rollout_path,
+            false,
+            None,
+        ))
+        .await
+        .map_err(|e| Error::internal_error().data(e.to_string()))?;
+
+        let new_session_id = Self::session_id_from_thread_id(thread_id);
+        self.session_roots
+            .lock()
+            .unwrap()
+            .insert(new_session_id.clone(), config.cwd.to_path_buf());
+
+        let thread = Arc::new(Thread::new(
+            new_session_id.clone(),
+            thread,
+            self.auth_manager.clone(),
+            Arc::new(self.thread_manager.get_models_manager()),
+            self.client_capabilities.clone(),
+            config,
+            cx,
+        ));
+        let load = thread.load().await?;
+
+        self.sessions
+            .lock()
+            .unwrap()
+            .insert(new_session_id.clone(), thread);
+
+        Ok(ForkSessionResponse::new(new_session_id)
             .modes(load.modes)
             .models(load.models)
             .config_options(load.config_options))
