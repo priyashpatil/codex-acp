@@ -1547,6 +1547,7 @@ dependencies = [
  "shlex",
  "tokio",
  "tokio-util",
+ "toml_edit 0.24.1+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
  "unicode-segmentation",
