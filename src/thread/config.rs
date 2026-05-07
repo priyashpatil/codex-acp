@@ -100,8 +100,8 @@ pub(super) fn mode_trusts_project(mode_id: &str) -> bool {
     matches!(mode_id, "auto" | "full-access")
 }
 
-pub(super) fn format_service_tier_name(service_tier: Option<ServiceTier>) -> &'static str {
-    match service_tier {
+pub(super) fn format_service_tier_name(service_tier: Option<&str>) -> &'static str {
+    match service_tier.and_then(ServiceTier::from_request_value) {
         Some(ServiceTier::Fast) => "Fast",
         Some(ServiceTier::Flex) => "Flex",
         None => "Standard",

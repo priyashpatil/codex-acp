@@ -31,10 +31,6 @@ pub(super) fn builtin_commands() -> Vec<AvailableCommand> {
             "compact",
             "summarize conversation to prevent hitting the context limit",
         ),
-        AvailableCommand::new("rename", "rename the current thread").input(
-            AvailableCommandInput::Unstructured(UnstructuredCommandInput::new("new name")),
-        ),
-        AvailableCommand::new("undo", "undo Codex’s most recent turn"),
         AvailableCommand::new("logout", "logout of Codex"),
         AvailableCommand::new("fast", "toggle fast mode for this session").input(
             AvailableCommandInput::Unstructured(UnstructuredCommandInput::new(
@@ -83,14 +79,6 @@ pub(super) fn skill_commands(skills: &[SkillMetadata]) -> Vec<AvailableCommand> 
             ))
         })
         .collect()
-}
-
-pub(super) fn skills_for_cwd(cwd: &Path, entries: &[SkillsListEntry]) -> Vec<SkillMetadata> {
-    entries
-        .iter()
-        .find(|entry| entry.cwd.as_path() == cwd)
-        .map(|entry| entry.skills.clone())
-        .unwrap_or_default()
 }
 
 pub(super) fn format_skills(skills: &[SkillMetadata]) -> String {

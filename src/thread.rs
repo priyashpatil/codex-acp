@@ -29,7 +29,6 @@ use codex_core::{
     config::{Config, set_project_trust_level},
     review_format::format_review_findings_block,
     review_prompts::user_facing_hint,
-    util::normalize_thread_name,
 };
 use codex_login::auth::AuthManager;
 use codex_models_manager::manager::{ModelsManager, RefreshStrategy};
@@ -58,7 +57,7 @@ use codex_protocol::{
     protocol::{
         AgentMessageContentDeltaEvent, AgentMessageEvent, AgentReasoningEvent,
         AgentReasoningRawContentEvent, AgentReasoningSectionBreakEvent, AgentStatus,
-        ApplyPatchApprovalRequestEvent, BackgroundEventEvent, CollabAgentInteractionBeginEvent,
+        ApplyPatchApprovalRequestEvent, CollabAgentInteractionBeginEvent,
         CollabAgentInteractionEndEvent, CollabAgentSpawnBeginEvent, CollabAgentSpawnEndEvent,
         CollabCloseBeginEvent, CollabCloseEndEvent, CollabResumeBeginEvent, CollabResumeEndEvent,
         CollabWaitingBeginEvent, CollabWaitingEndEvent, DeprecationNoticeEvent,
@@ -67,15 +66,15 @@ use codex_protocol::{
         ExecCommandOutputDeltaEvent, ExecCommandStatus, ExitedReviewModeEvent, FileChange,
         GuardianAssessmentEvent, GuardianAssessmentStatus, HookCompletedEvent, HookStartedEvent,
         ImageGenerationBeginEvent, ImageGenerationEndEvent, ItemCompletedEvent, ItemStartedEvent,
-        ListSkillsResponseEvent, McpInvocation, McpStartupCompleteEvent, McpStartupStatus,
-        McpStartupUpdateEvent, McpToolCallBeginEvent, McpToolCallEndEvent, ModelRerouteEvent,
+        McpInvocation, McpStartupCompleteEvent, McpStartupStatus, McpStartupUpdateEvent,
+        McpToolCallBeginEvent, McpToolCallEndEvent, ModelRerouteEvent,
         ModelVerification, ModelVerificationEvent, NetworkApprovalContext, NetworkPolicyRuleAction,
         Op, PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus, PatchApplyUpdatedEvent,
         PlanDeltaEvent, RawResponseItemEvent, ReasoningContentDeltaEvent,
         ReasoningRawContentDeltaEvent, ReviewDecision, ReviewOutputEvent, ReviewRequest,
-        ReviewTarget, RolloutItem, SkillMetadata, SkillsListEntry, StreamErrorEvent,
-        TerminalInteractionEvent, ThreadGoalStatus, ThreadGoalUpdatedEvent, ThreadRolledBackEvent,
-        TokenCountEvent, TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent, UserMessageEvent,
+        ReviewTarget, RolloutItem, SkillMetadata, StreamErrorEvent, TerminalInteractionEvent,
+        ThreadGoalStatus, ThreadGoalUpdatedEvent, ThreadRolledBackEvent, TokenCountEvent,
+        TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent, UserMessageEvent,
         ViewImageToolCallEvent, WarningEvent, WebSearchBeginEvent, WebSearchEndEvent,
     },
     request_permissions::{
@@ -92,7 +91,6 @@ use codex_shell_command::parse_command::parse_command;
 use codex_utils_approval_presets::{ApprovalPreset, builtin_approval_presets};
 use heck::ToTitleCase;
 use itertools::Itertools;
-use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 use unicode_segmentation::UnicodeSegmentation;
@@ -109,7 +107,6 @@ use client::ClientSender;
 use client::SessionClient;
 use commands::{
     builtin_commands, extract_slash_command, format_skills, run_git_diff, skill_commands,
-    skills_for_cwd,
 };
 #[cfg(test)]
 use config::CODEX_WORKSPACE_PROFILE_ID;
@@ -212,9 +209,6 @@ impl Auth for Arc<AuthManager> {
 enum ThreadMessage {
     Load {
         response_tx: oneshot::Sender<Result<LoadSessionResponse, Error>>,
-    },
-    SkillsLoaded {
-        skills: Option<Vec<SkillMetadata>>,
     },
     GetConfigOptions {
         response_tx: oneshot::Sender<Result<Vec<SessionConfigOption>, Error>>,
@@ -613,27 +607,20 @@ fn format_mcp_startup_complete(
 
 #[expect(clippy::large_enum_variant)]
 enum SubmissionState {
-    /// Loading skills for the current workspace.
-    Skills(SkillsState),
-    /// User prompts, including slash commands like /init, /review, /compact, /undo.
+    /// User prompts, including slash commands like /init, /review, /compact.
     Prompt(PromptState),
-    Rename(RenameState),
 }
 
 impl SubmissionState {
     fn is_active(&self) -> bool {
         match self {
-            Self::Skills(state) => state.is_active(),
             Self::Prompt(state) => state.is_active(),
-            Self::Rename(state) => state.is_active(),
         }
     }
 
     async fn handle_event(&mut self, client: &SessionClient, event: EventMsg) {
         match self {
-            Self::Skills(state) => state.handle_event(event),
             Self::Prompt(state) => state.handle_event(client, event).await,
-            Self::Rename(state) => state.handle_event(client, event),
         }
     }
 
@@ -644,15 +631,10 @@ impl SubmissionState {
         response: Result<RequestPermissionResponse, Error>,
     ) -> Result<(), Error> {
         match self {
-            Self::Skills(..) => Ok(()),
             Self::Prompt(state) => {
                 state
                     .handle_permission_request_resolved(client, request_key, response)
                     .await
-            }
-            Self::Rename(_) => {
-                warn!("Ignoring permission response for rename submission");
-                Ok(())
             }
         }
     }
@@ -662,55 +644,15 @@ impl SubmissionState {
             Self::Prompt(state) => {
                 state.abort_pending_interactions();
             }
-            Self::Skills(_) => {}
-            Self::Rename(_) => {}
         }
     }
 
     fn fail(&mut self, err: Error) {
         match self {
-            Self::Skills(state) => {
-                if let Some(response_tx) = state.response_tx.take() {
-                    drop(response_tx.send(Err(err)));
-                }
-            }
             Self::Prompt(state) => {
                 if let Some(response_tx) = state.response_tx.take() {
                     drop(response_tx.send(Err(err)));
                 }
-            }
-            Self::Rename(state) => state.fail(err),
-        }
-    }
-}
-
-struct SkillsState {
-    response_tx: Option<oneshot::Sender<Result<Vec<SkillsListEntry>, Error>>>,
-}
-
-impl SkillsState {
-    fn new(response_tx: oneshot::Sender<Result<Vec<SkillsListEntry>, Error>>) -> Self {
-        Self {
-            response_tx: Some(response_tx),
-        }
-    }
-
-    fn is_active(&self) -> bool {
-        let Some(response_tx) = &self.response_tx else {
-            return false;
-        };
-        !response_tx.is_closed()
-    }
-
-    fn handle_event(&mut self, event: EventMsg) {
-        match event {
-            EventMsg::ListSkillsResponse(ListSkillsResponseEvent { skills }) => {
-                if let Some(tx) = self.response_tx.take() {
-                    drop(tx.send(Ok(skills)));
-                }
-            }
-            event => {
-                warn!("Unexpected event: {event:?}");
             }
         }
     }
@@ -769,71 +711,6 @@ struct PromptState {
     plan_output_text: Option<String>,
     last_plan: Vec<PlanItemArg>,
     prompted_for_plan_implementation: bool,
-}
-
-struct RenameState {
-    response_tx: Option<oneshot::Sender<Result<StopReason, Error>>>,
-}
-
-impl RenameState {
-    fn new(response_tx: oneshot::Sender<Result<StopReason, Error>>) -> Self {
-        Self {
-            response_tx: Some(response_tx),
-        }
-    }
-
-    fn is_active(&self) -> bool {
-        self.response_tx
-            .as_ref()
-            .is_some_and(|response_tx| !response_tx.is_closed())
-    }
-
-    fn fail(&mut self, err: Error) {
-        if let Some(response_tx) = self.response_tx.take() {
-            drop(response_tx.send(Err(err)));
-        }
-    }
-
-    fn handle_event(&mut self, client: &SessionClient, event: EventMsg) {
-        match event {
-            EventMsg::ThreadNameUpdated(event) => {
-                if let Some(title) = event.thread_name {
-                    send_session_title_update(client, Some(title.clone()));
-                    client.send_agent_text(format!("Thread renamed to: {title}\n"));
-                    if let Some(response_tx) = self.response_tx.take() {
-                        drop(response_tx.send(Ok(StopReason::EndTurn)));
-                    }
-                }
-            }
-            EventMsg::Error(ErrorEvent {
-                message,
-                codex_error_info,
-            }) => {
-                if let Some(response_tx) = self.response_tx.take() {
-                    drop(response_tx.send(Err(Error::internal_error().data(
-                        json!({ "message": message, "codex_error_info": codex_error_info }),
-                    ))));
-                }
-            }
-            EventMsg::StreamError(StreamErrorEvent {
-                message,
-                codex_error_info,
-                additional_details,
-            }) => {
-                error!(
-                    "Rename failed during stream: {message} {codex_error_info:?} {additional_details:?}"
-                );
-                if let Some(response_tx) = self.response_tx.take() {
-                    drop(response_tx.send(Err(Error::internal_error().data(
-                        json!({ "message": message, "codex_error_info": codex_error_info }),
-                    ))));
-                }
-            }
-            event => {
-                debug!("Ignoring event for rename submission: {event:?}");
-            }
-        }
-    }
 }
 
 impl PromptState {
@@ -1534,7 +1411,12 @@ impl PromptState {
                         client.send_notification(SessionUpdate::UsageUpdate(update));
                     }
             }
-            EventMsg::ItemStarted(ItemStartedEvent { thread_id, turn_id, item }) => {
+            EventMsg::ItemStarted(ItemStartedEvent {
+                thread_id,
+                turn_id,
+                item,
+                ..
+            }) => {
                 info!("Item started with thread_id: {thread_id}, turn_id: {turn_id}, item: {item:?}");
                 if let TurnItem::ContextCompaction(item) = item {
                     self.start_context_compaction(client, &item.id);
@@ -1602,10 +1484,6 @@ impl PromptState {
             EventMsg::AgentReasoningRawContent(AgentReasoningRawContentEvent { text }) => {
                 info!("Agent reasoning raw content received");
                 client.send_agent_thought(text);
-            }
-            EventMsg::ThreadNameUpdated(event) => {
-                info!("Thread name updated: {:?}", event.thread_name);
-                send_session_title_update(client, event.thread_name);
             }
             EventMsg::SessionConfigured(event) => {
                 info!("Session configured with thread name: {:?}", event.thread_name);
@@ -1680,7 +1558,14 @@ impl PromptState {
                 );
                 self.terminal_interaction(client, event);
             }
-            EventMsg::DynamicToolCallRequest(DynamicToolCallRequest { call_id, turn_id, namespace, tool, arguments }) => {
+            EventMsg::DynamicToolCallRequest(DynamicToolCallRequest {
+                call_id,
+                turn_id,
+                namespace,
+                tool,
+                arguments,
+                ..
+            }) => {
                 info!("Dynamic tool call request: call_id={call_id}, turn_id={turn_id}, namespace={namespace:?}, tool={tool}");
                 self.start_dynamic_tool_call(client, call_id, tool, arguments);
             }
@@ -1865,6 +1750,7 @@ impl PromptState {
                 thread_id,
                 turn_id,
                 item,
+                ..
             }) => {
                 info!("Item completed: thread_id={}, turn_id={}, item={:?}", thread_id, turn_id, item);
                 match item {
@@ -1900,21 +1786,6 @@ impl PromptState {
                     response_tx.send(Ok(StopReason::EndTurn)).ok();
                 }
             }
-            EventMsg::UndoStarted(event) => {
-                client.send_agent_text(
-                    event
-                        .message
-                        .unwrap_or_else(|| "Undo in progress...".to_string()),
-                );
-            }
-            EventMsg::UndoCompleted(event) => {
-                let fallback = if event.success {
-                    "Undo completed.".to_string()
-                } else {
-                    "Undo failed.".to_string()
-                };
-                client.send_agent_text(event.message.unwrap_or(fallback));
-            }
             EventMsg::StreamError(StreamErrorEvent {
                 message,
                 codex_error_info,
@@ -1937,7 +1808,7 @@ impl PromptState {
                 if let Some(response_tx) = self.response_tx.take() {
                     response_tx
                         .send(Err(Error::internal_error().data(
-                            json!({ "message": message, "codex_error_info": codex_error_info }),
+                            serde_json::json!({ "message": message, "codex_error_info": codex_error_info }),
                         )))
                         .ok();
                 }
@@ -2043,10 +1914,6 @@ impl PromptState {
                     "Thread rolled back: {num_turns} turn{suffix} removed from context.\n"
                 ));
             }
-            EventMsg::BackgroundEvent(BackgroundEventEvent { message }) => {
-                info!("Background event: {message}");
-                client.send_agent_text(format!("{message}\n"));
-            }
             EventMsg::DeprecationNotice(DeprecationNoticeEvent { summary, details }) => {
                 warn!("Deprecation notice: {summary}");
                 let message = if let Some(details) = details {
@@ -2091,19 +1958,11 @@ impl PromptState {
             // Ignore these events
             EventMsg::TurnDiff(..)
             | EventMsg::SkillsUpdateAvailable
-            // Old events
-            | EventMsg::AgentMessageDelta(..)
-            | EventMsg::AgentReasoningDelta(..)
-            | EventMsg::AgentReasoningRawContentDelta(..)
             | EventMsg::RealtimeConversationStarted(..)
             | EventMsg::RealtimeConversationRealtime(..)
             | EventMsg::RealtimeConversationClosed(..)
             | EventMsg::RealtimeConversationSdp(..)=> {}
-            e @ (EventMsg::McpListToolsResponse(..)
-            | EventMsg::ListSkillsResponse(..)
-            | EventMsg::RealtimeConversationListVoicesResponse(..)
-            // Used for returning a single history entry
-            | EventMsg::GetHistoryEntryResponse(..)) => {
+            e @ EventMsg::RealtimeConversationListVoicesResponse(..) => {
                 warn!("Unexpected event: {:?}", e);
             }
         }
@@ -2414,6 +2273,7 @@ impl PromptState {
             model: _,
             reasoning_effort: _,
             status,
+            ..
         } = event;
 
         let thread_id = new_thread_id.map(|thread_id| thread_id.to_string());
@@ -2453,6 +2313,7 @@ impl PromptState {
             sender_thread_id: _,
             receiver_thread_id,
             prompt,
+            ..
         } = event;
         let receiver_thread_id = receiver_thread_id.to_string();
         let tool_call_id = ToolCallId::new(call_id.clone());
@@ -2491,6 +2352,7 @@ impl PromptState {
             receiver_agent_role,
             prompt: _,
             status,
+            ..
         } = event;
         let receiver_thread_id = receiver_thread_id.to_string();
         let tool_call_id = self
@@ -2527,6 +2389,7 @@ impl PromptState {
             receiver_thread_ids,
             receiver_agents,
             call_id,
+            ..
         } = event;
         let title = format!(
             "Waiting for {} subagent{}",
@@ -2569,6 +2432,7 @@ impl PromptState {
             call_id,
             agent_statuses,
             statuses,
+            ..
         } = event;
         let tool_call_id = self
             .active_subagents_by_call
@@ -2597,6 +2461,7 @@ impl PromptState {
             call_id,
             sender_thread_id: _,
             receiver_thread_id,
+            ..
         } = event;
         let receiver_thread_id = receiver_thread_id.to_string();
         let tool_call_id = ToolCallId::new(call_id.clone());
@@ -2627,6 +2492,7 @@ impl PromptState {
             receiver_agent_nickname,
             receiver_agent_role,
             status,
+            ..
         } = event;
         let receiver_thread_id = receiver_thread_id.to_string();
         let tool_call_id = self
@@ -2660,6 +2526,7 @@ impl PromptState {
             receiver_thread_id,
             receiver_agent_nickname,
             receiver_agent_role,
+            ..
         } = event;
         let receiver_thread_id = receiver_thread_id.to_string();
         let tool_call_id = ToolCallId::new(call_id.clone());
@@ -2697,6 +2564,7 @@ impl PromptState {
             receiver_agent_nickname,
             receiver_agent_role,
             status,
+            ..
         } = event;
         let receiver_thread_id = receiver_thread_id.to_string();
         let tool_call_id = self
@@ -2749,6 +2617,7 @@ impl PromptState {
             success,
             error,
             duration: _,
+            ..
         } = event;
 
         client.send_tool_call_update(ToolCallUpdate::new(
@@ -2953,6 +2822,7 @@ impl PromptState {
             cwd,
             parsed_cmd,
             process_id: _,
+            ..
         } = event;
         // Create a new tool call for the command execution
         let tool_call_id = ToolCallId::new(call_id.clone());
@@ -3064,6 +2934,7 @@ impl PromptState {
             formatted_output: _,
             process_id: _,
             status,
+            ..
         } = event;
         if let Some(active_command) = self.active_commands.remove(&call_id) {
             let is_success = exit_code == 0;
@@ -3496,12 +3367,6 @@ impl<A: Auth> ThreadActor<A> {
             ThreadMessage::Load { response_tx } => {
                 let result = self.handle_load().await;
                 drop(response_tx.send(result));
-                self.refresh_skills(true).await;
-            }
-            ThreadMessage::SkillsLoaded { skills } => {
-                if let Some(skills) = skills {
-                    self.skills = skills;
-                }
                 self.send_available_commands_update();
             }
             ThreadMessage::GetConfigOptions { response_tx } => {
@@ -3598,56 +3463,6 @@ impl<A: Auth> ThreadActor<A> {
             ));
     }
 
-    async fn load_skills(
-        &mut self,
-        force_reload: bool,
-    ) -> oneshot::Receiver<Result<Vec<SkillsListEntry>, Error>> {
-        let (response_tx, response_rx) = oneshot::channel();
-        let submission_id = match self
-            .thread
-            .submit(Op::ListSkills {
-                cwds: Vec::new(),
-                force_reload,
-            })
-            .await
-        {
-            Ok(id) => id,
-            Err(error) => {
-                drop(response_tx.send(Err(Error::internal_error().data(error.to_string()))));
-                return response_rx;
-            }
-        };
-
-        self.submissions.insert(
-            submission_id,
-            SubmissionState::Skills(SkillsState::new(response_tx)),
-        );
-
-        response_rx
-    }
-
-    async fn refresh_skills(&mut self, force_reload: bool) {
-        let load_skills = self.load_skills(force_reload).await;
-        let resolution_tx = self.resolution_tx.clone();
-        let cwd = self.config.cwd.clone();
-
-        tokio::spawn(async move {
-            let skills = match load_skills.await {
-                Ok(Ok(entries)) => Some(skills_for_cwd(cwd.as_path(), &entries)),
-                Ok(Err(error)) => {
-                    error!("Failed to refresh skills: {error:?}");
-                    None
-                }
-                Err(error) => {
-                    error!("Failed to receive skills response: {error:?}");
-                    None
-                }
-            };
-
-            drop(resolution_tx.send(ThreadMessage::SkillsLoaded { skills }));
-        });
-    }
-
     fn resolve_skill_command(&self, name: &str) -> Option<SkillMetadata> {
         let skill_name = name.strip_prefix("skills:")?;
         self.skills
@@ -3735,7 +3550,12 @@ impl<A: Auth> ThreadActor<A> {
     }
 
     fn current_service_tier_id(&self) -> &'static str {
-        match self.config.service_tier {
+        match self
+            .config
+            .service_tier
+            .as_deref()
+            .and_then(ServiceTier::from_request_value)
+        {
             Some(ServiceTier::Fast) => "fast",
             Some(ServiceTier::Flex) => "flex",
             None => "standard",
@@ -3962,14 +3782,14 @@ impl<A: Auth> ThreadActor<A> {
                 collaboration_mode: None,
                 personality: None,
                 windows_sandbox_level: None,
-                service_tier: Some(service_tier),
+                service_tier: Some(service_tier.map(|tier| tier.request_value().to_string())),
                 approvals_reviewer: None,
                 permission_profile: None,
             })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
 
-        self.config.service_tier = service_tier;
+        self.config.service_tier = service_tier.map(|tier| tier.request_value().to_string());
         persist_service_tier_default(&self.config, service_tier).await?;
 
         Ok(())
@@ -3996,7 +3816,7 @@ impl<A: Auth> ThreadActor<A> {
 
         format!(
             "## Session Status\n\n**Model:** {model}\n**Reasoning Effort:** {reasoning}\n**Mode:** {mode}\n**Service Tier:** {}\n**Working Directory:** {}\n",
-            format_service_tier_name(self.config.service_tier),
+            format_service_tier_name(self.config.service_tier.as_deref()),
             self.config.cwd.display()
         )
     }
@@ -4230,7 +4050,6 @@ impl<A: Auth> ThreadActor<A> {
             } else {
                 match name {
                     "compact" => op = Op::Compact,
-                    "undo" => op = Op::Undo,
                     "init" => {
                         op = Op::UserInput {
                             items: vec![UserInput::Text {
@@ -4289,7 +4108,7 @@ impl<A: Auth> ThreadActor<A> {
                     "fast" => {
                         let tier = match rest.trim().to_ascii_lowercase().as_str() {
                             "" => {
-                                if matches!(self.config.service_tier, Some(ServiceTier::Fast)) {
+                                if self.current_service_tier_id() == "fast" {
                                     None
                                 } else {
                                     Some(ServiceTier::Fast)
@@ -4298,10 +4117,7 @@ impl<A: Auth> ThreadActor<A> {
                             "on" => Some(ServiceTier::Fast),
                             "off" => None,
                             "status" => {
-                                let status = if matches!(
-                                    self.config.service_tier,
-                                    Some(ServiceTier::Fast)
-                                ) {
+                                let status = if self.current_service_tier_id() == "fast" {
                                     "on"
                                 } else {
                                     "off"
@@ -4379,19 +4195,6 @@ impl<A: Auth> ThreadActor<A> {
                         output.push_str(&self.format_mcp_servers());
                         self.client.send_agent_text(output);
                         response_tx.send(Ok(StopReason::EndTurn)).ok();
-                        return Ok(response_rx);
-                    }
-                    "rename" if !rest.is_empty() => {
-                        let name = normalize_thread_name(rest).ok_or_else(Error::invalid_params)?;
-                        let submission_id = self
-                            .thread
-                            .submit(Op::SetThreadName { name })
-                            .await
-                            .map_err(|e| Error::internal_error().data(e.to_string()))?;
-                        self.submissions.insert(
-                            submission_id,
-                            SubmissionState::Rename(RenameState::new(response_tx)),
-                        );
                         return Ok(response_rx);
                     }
                     _ => {
@@ -4697,9 +4500,6 @@ impl<A: Auth> ThreadActor<A> {
                 self.client.send_agent_thought(text.clone());
             }
             EventMsg::SessionConfigured(event) => {
-                send_session_title_update(&self.client, event.thread_name.clone());
-            }
-            EventMsg::ThreadNameUpdated(event) => {
                 send_session_title_update(&self.client, event.thread_name.clone());
             }
             EventMsg::ThreadGoalUpdated(event) => {
@@ -5042,7 +4842,7 @@ impl<A: Auth> ThreadActor<A> {
 
     async fn handle_event(&mut self, Event { id, msg }: Event) {
         if matches!(msg, EventMsg::SkillsUpdateAvailable) {
-            self.refresh_skills(true).await;
+            self.send_available_commands_update();
             return;
         }
 
@@ -5056,15 +4856,9 @@ impl<A: Auth> ThreadActor<A> {
 
         if let Some(submission) = self.submissions.get_mut(&id) {
             submission.handle_event(&self.client, msg).await;
-        } else if matches!(
-            &msg,
-            EventMsg::SessionConfigured(..) | EventMsg::ThreadNameUpdated(..)
-        ) {
+        } else if matches!(&msg, EventMsg::SessionConfigured(..)) {
             match msg {
                 EventMsg::SessionConfigured(event) => {
-                    send_session_title_update(&self.client, event.thread_name);
-                }
-                EventMsg::ThreadNameUpdated(event) => {
                     send_session_title_update(&self.client, event.thread_name);
                 }
                 _ => unreachable!(),
