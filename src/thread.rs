@@ -11,16 +11,16 @@ use agent_client_protocol::{
     schema::{
         AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, ClientCapabilities,
         ConfigOptionUpdate, Content, ContentBlock, ContentChunk, Cost, Diff, EmbeddedResource,
-        EmbeddedResourceResource, LoadSessionResponse, Meta, ModelId, ModelInfo, PermissionOption,
-        PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptRequest,
-        RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-        ResourceLink, SelectedPermissionOutcome, SessionConfigId, SessionConfigOption,
-        SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectOption,
-        SessionConfigValueId, SessionId, SessionInfoUpdate, SessionMode, SessionModeId,
-        SessionModeState, SessionModelState, SessionNotification, SessionUpdate, StopReason,
-        Terminal, TextContent, TextResourceContents, ToolCall, ToolCallContent, ToolCallId,
-        ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
-        UnstructuredCommandInput, UsageUpdate,
+        EmbeddedResourceResource, ImageContent, LoadSessionResponse, Meta, ModelId, ModelInfo,
+        PermissionOption, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority,
+        PlanEntryStatus, PromptRequest, RequestPermissionOutcome, RequestPermissionRequest,
+        RequestPermissionResponse, ResourceLink, SelectedPermissionOutcome, SessionConfigId,
+        SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
+        SessionConfigSelectOption, SessionConfigValueId, SessionId, SessionInfoUpdate, SessionMode,
+        SessionModeId, SessionModeState, SessionModelState, SessionNotification, SessionUpdate,
+        StopReason, Terminal, TextContent, TextResourceContents, ToolCall, ToolCallContent,
+        ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+        ToolKind, UnstructuredCommandInput, UsageUpdate,
     },
 };
 use codex_apply_patch::parse_patch;
@@ -131,8 +131,9 @@ use tools::{
     ParseCommandToolCall, agent_status_to_tool_status, aggregate_agent_statuses,
     extract_tool_call_content_from_changes, format_file_system_entries, generate_fallback_id,
     guardian_assessment_content, guardian_assessment_tool_call_id,
-    guardian_assessment_tool_call_status, parse_command_tool_call,
-    response_item_status_to_tool_status, web_search_action_to_title_and_id,
+    guardian_assessment_tool_call_status, image_generation_content, image_generation_tool_status,
+    parse_command_tool_call, response_item_status_to_tool_status,
+    web_search_action_to_title_and_id,
 };
 
 const INIT_COMMAND_PROMPT: &str = include_str!("./prompt_for_init_command.md");
@@ -692,6 +693,7 @@ struct PromptState {
     submission_id: String,
     active_commands: HashMap<String, ActiveCommand>,
     active_web_searches: HashSet<String>,
+    active_image_generations: HashSet<String>,
     active_context_compactions: HashSet<String>,
     active_patch_applies: HashSet<String>,
     active_guardian_assessments: HashSet<String>,
@@ -724,6 +726,7 @@ impl PromptState {
             submission_id,
             active_commands: HashMap::new(),
             active_web_searches: HashSet::new(),
+            active_image_generations: HashSet::new(),
             active_context_compactions: HashSet::new(),
             active_patch_applies: HashSet::new(),
             active_guardian_assessments: HashSet::new(),
@@ -1738,33 +1741,16 @@ impl PromptState {
                     }
                 ));
             }
-            EventMsg::ImageGenerationBegin(ImageGenerationBeginEvent { call_id }) => {
-                info!("Image generation started: call_id={call_id}");
-                client.send_tool_call(
-                    ToolCall::new(call_id, "Generating image")
-                        .kind(ToolKind::Other)
-                        .status(ToolCallStatus::InProgress),
-                );
+            EventMsg::ImageGenerationBegin(event) => {
+                info!("Image generation started: call_id={}", event.call_id);
+                self.start_image_generation(client, event);
             }
-            EventMsg::ImageGenerationEnd(ImageGenerationEndEvent {
-                call_id,
-                status,
-                revised_prompt: _,
-                result,
-                saved_path: _,
-            }) => {
-                info!("Image generation ended: call_id={call_id}, status={status}");
-                let tool_status = if status == "success" {
-                    ToolCallStatus::Completed
-                } else {
-                    ToolCallStatus::Failed
-                };
-                client.send_tool_call_update(ToolCallUpdate::new(
-                    call_id,
-                    ToolCallUpdateFields::new()
-                        .status(tool_status)
-                        .content(vec![result.into()]),
-                ));
+            EventMsg::ImageGenerationEnd(event) => {
+                info!(
+                    "Image generation ended: call_id={}, status={}",
+                    event.call_id, event.status
+                );
+                self.end_image_generation(client, event);
             }
             EventMsg::ItemCompleted(ItemCompletedEvent {
                 thread_id,
@@ -3067,6 +3053,50 @@ impl PromptState {
         client.send_tool_call(ToolCall::new(call_id, "Searching the Web").kind(ToolKind::Fetch));
     }
 
+    fn start_image_generation(&mut self, client: &SessionClient, event: ImageGenerationBeginEvent) {
+        let raw_input = serde_json::json!(&event);
+        let ImageGenerationBeginEvent { call_id } = event;
+        self.active_image_generations.insert(call_id.clone());
+        client.send_tool_call(
+            ToolCall::new(call_id, "Image generation")
+                .kind(ToolKind::Other)
+                .status(ToolCallStatus::InProgress)
+                .raw_input(raw_input),
+        );
+    }
+
+    fn end_image_generation(&mut self, client: &SessionClient, event: ImageGenerationEndEvent) {
+        let raw_output = serde_json::json!(&event);
+        let ImageGenerationEndEvent {
+            call_id,
+            status,
+            revised_prompt,
+            result,
+            saved_path,
+        } = event;
+        let tool_status = image_generation_tool_status(&status);
+        let saved_path = saved_path.map(|path| path.to_string_lossy().into_owned());
+        let content = image_generation_content(revised_prompt, result, saved_path);
+
+        if self.active_image_generations.remove(&call_id) {
+            client.send_tool_call_update(ToolCallUpdate::new(
+                call_id,
+                ToolCallUpdateFields::new()
+                    .status(tool_status)
+                    .content(content)
+                    .raw_output(raw_output),
+            ));
+        } else {
+            client.send_tool_call(
+                ToolCall::new(call_id, "Image generation")
+                    .kind(ToolKind::Other)
+                    .status(tool_status)
+                    .content(content)
+                    .raw_output(raw_output),
+            );
+        }
+    }
+
     fn update_web_search_query(
         &self,
         client: &SessionClient,
@@ -3303,23 +3333,21 @@ impl PromptState {
                 revised_prompt,
                 result,
             } => {
-                let content = revised_prompt.as_ref().map(|prompt| {
-                    vec![ToolCallContent::Content(Content::new(ContentBlock::Text(
-                        TextContent::new(prompt.clone()),
-                    )))]
-                });
-                let mut tool_call = ToolCall::new(id, "Generate image")
-                    .kind(ToolKind::Other)
-                    .status(response_item_status_to_tool_status(&status))
-                    .raw_output(serde_json::json!({
-                        "status": status,
-                        "revised_prompt": revised_prompt,
-                        "result": result,
-                    }));
-                if let Some(content) = content {
-                    tool_call = tool_call.content(content);
-                }
-                client.send_tool_call(tool_call);
+                client.send_tool_call(
+                    ToolCall::new(id, "Image generation")
+                        .kind(ToolKind::Other)
+                        .status(image_generation_tool_status(&status))
+                        .content(image_generation_content(
+                            revised_prompt.clone(),
+                            result.clone(),
+                            None,
+                        ))
+                        .raw_output(serde_json::json!({
+                            "status": status,
+                            "revised_prompt": revised_prompt,
+                            "result": result,
+                        })),
+                );
             }
             _ => {}
         }
@@ -4866,23 +4894,21 @@ impl<A: Auth> ThreadActor<A> {
                 revised_prompt,
                 result,
             } => {
-                let content = revised_prompt.as_ref().map(|prompt| {
-                    vec![ToolCallContent::Content(Content::new(ContentBlock::Text(
-                        TextContent::new(prompt.clone()),
-                    )))]
-                });
-                let mut tool_call = ToolCall::new(id.clone(), "Generate image")
-                    .kind(ToolKind::Other)
-                    .status(response_item_status_to_tool_status(status))
-                    .raw_output(serde_json::json!({
-                        "status": status,
-                        "revised_prompt": revised_prompt,
-                        "result": result,
-                    }));
-                if let Some(content) = content {
-                    tool_call = tool_call.content(content);
-                }
-                self.client.send_tool_call(tool_call);
+                self.client.send_tool_call(
+                    ToolCall::new(id.clone(), "Image generation")
+                        .kind(ToolKind::Other)
+                        .status(image_generation_tool_status(status))
+                        .content(image_generation_content(
+                            revised_prompt.clone(),
+                            result.clone(),
+                            None,
+                        ))
+                        .raw_output(serde_json::json!({
+                            "status": status,
+                            "revised_prompt": revised_prompt,
+                            "result": result,
+                        })),
+                );
             }
             // Skip GhostSnapshot, Compaction, Other, LocalShellCall without call_id
             _ => {}

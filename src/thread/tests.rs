@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
@@ -105,7 +106,7 @@ async fn test_model_verification_and_lifecycle_events_are_visible() -> anyhow::R
         matches!(
             &notification.update,
             SessionUpdate::ToolCall(tool_call)
-                if tool_call.title == "Generating image"
+                if tool_call.title == "Image generation"
                     && tool_call.status == ToolCallStatus::InProgress
         )
     }));
@@ -119,6 +120,79 @@ async fn test_model_verification_and_lifecycle_events_are_visible() -> anyhow::R
     }));
 
     Ok(())
+}
+
+#[tokio::test]
+async fn test_image_generation_emits_image_content() -> anyhow::Result<()> {
+    let (session_id, client, _, message_tx, _handle) = setup().await?;
+    let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+    let expected_uri = image_generation_test_saved_path()
+        .to_string_lossy()
+        .into_owned();
+
+    message_tx.send(ThreadMessage::Prompt {
+        request: PromptRequest::new(session_id.clone(), vec!["image-generation".into()]),
+        response_tx: prompt_response_tx,
+    })?;
+
+    let stop_reason = prompt_response_rx.await??.await??;
+    assert_eq!(stop_reason, StopReason::EndTurn);
+    drop(message_tx);
+
+    let notifications = client.notifications.lock().unwrap();
+    let tool_call = notifications
+        .iter()
+        .find_map(|notification| match &notification.update {
+            SessionUpdate::ToolCall(tool_call) if tool_call.tool_call_id.0.as_ref() == "ig-1" => {
+                Some(tool_call)
+            }
+            _ => None,
+        })
+        .expect("image generation tool call should be sent");
+    assert_eq!(tool_call.title, "Image generation");
+    assert_eq!(tool_call.status, ToolCallStatus::InProgress);
+
+    let update = notifications
+        .iter()
+        .find_map(|notification| match &notification.update {
+            SessionUpdate::ToolCallUpdate(update) if update.tool_call_id.0.as_ref() == "ig-1" => {
+                Some(update)
+            }
+            _ => None,
+        })
+        .expect("image generation tool call update should be sent");
+    assert_eq!(update.fields.status, Some(ToolCallStatus::Completed));
+    let content = update
+        .fields
+        .content
+        .as_ref()
+        .expect("image generation update should include content");
+    assert_eq!(content.len(), 2);
+    assert!(matches!(
+        &content[0],
+        ToolCallContent::Content(Content {
+            content: ContentBlock::Text(TextContent { text, .. }),
+            ..
+        }) if text == "Revised prompt: A tiny blue square"
+    ));
+    assert!(matches!(
+        &content[1],
+        ToolCallContent::Content(Content {
+            content: ContentBlock::Image(ImageContent {
+                data,
+                mime_type,
+                uri,
+                ..
+            }),
+            ..
+        }) if data == "Zm9v" && mime_type == "image/png" && uri.as_deref() == Some(expected_uri.as_str())
+    ));
+
+    Ok(())
+}
+
+fn image_generation_test_saved_path() -> PathBuf {
+    std::env::temp_dir().join("ig-1.png")
 }
 
 #[tokio::test]
@@ -1695,6 +1769,34 @@ impl CodexThreadImpl for StubCodexThread {
                             duration_ms: None,
                             time_to_first_token_ms: None,
                         }));
+                    } else if prompt == "image-generation" {
+                        let turn_id = id.to_string();
+                        let saved_path = image_generation_test_saved_path();
+                        let send = |msg| {
+                            self.op_tx
+                                .send(Event {
+                                    id: id.to_string(),
+                                    msg,
+                                })
+                                .unwrap();
+                        };
+                        send(EventMsg::ImageGenerationBegin(ImageGenerationBeginEvent {
+                            call_id: "ig-1".into(),
+                        }));
+                        send(EventMsg::ImageGenerationEnd(ImageGenerationEndEvent {
+                            call_id: "ig-1".into(),
+                            status: "completed".into(),
+                            revised_prompt: Some("A tiny blue square".into()),
+                            result: "Zm9v".into(),
+                            saved_path: Some(saved_path.try_into()?),
+                        }));
+                        send(EventMsg::TurnComplete(TurnCompleteEvent {
+                            last_agent_message: None,
+                            turn_id,
+                            completed_at: None,
+                            duration_ms: None,
+                            time_to_first_token_ms: None,
+                        }));
                     } else if prompt == "raw-tool-items" {
                         let turn_id = id.to_string();
                         let send = |msg| {
@@ -2384,14 +2486,23 @@ async fn test_raw_response_items_surface_missing_tool_calls() -> anyhow::Result<
         &notification.update,
         SessionUpdate::ToolCall(tool_call)
             if tool_call.tool_call_id.0.as_ref() == "image-a"
-                && tool_call.title == "Generate image"
+                && tool_call.title == "Image generation"
                 && tool_call.status == ToolCallStatus::Completed
                 && matches!(
                     tool_call.content.as_slice(),
                     [ToolCallContent::Content(Content {
                         content: ContentBlock::Text(TextContent { text, .. }),
                         ..
-                    })] if text == "A compact interface mockup"
+                    }), ToolCallContent::Content(Content {
+                        content: ContentBlock::Image(ImageContent {
+                            data,
+                            mime_type,
+                            ..
+                        }),
+                        ..
+                    })] if text == "Revised prompt: A compact interface mockup"
+                        && data == "image-bytes"
+                        && mime_type == "image/png"
                 )
     )));
 
