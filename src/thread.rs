@@ -12,12 +12,12 @@ use agent_client_protocol::{
     schema::{
         AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, ClientCapabilities,
         ConfigOptionUpdate, Content, ContentBlock, ContentChunk, Diff, EmbeddedResource,
-        EmbeddedResourceResource, LoadSessionResponse, Meta, ModelId, ModelInfo, PermissionOption,
-        PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptRequest,
-        RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-        ResourceLink, SelectedPermissionOutcome, SessionConfigId, SessionConfigOption,
-        SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectOption,
-        SessionConfigValueId, SessionId, SessionInfoUpdate, SessionMode, SessionModeId,
+        EmbeddedResourceResource, ImageContent, LoadSessionResponse, Meta, ModelId, ModelInfo,
+        PermissionOption, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority,
+        PlanEntryStatus, PromptRequest, RequestPermissionOutcome, RequestPermissionRequest,
+        RequestPermissionResponse, ResourceLink, SelectedPermissionOutcome, SessionConfigId,
+        SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
+        SessionConfigSelectOption, SessionConfigValueId, SessionId, SessionMode, SessionModeId,
         SessionModeState, SessionModelState, SessionNotification, SessionUpdate, StopReason,
         Terminal, TextContent, TextResourceContents, ToolCall, ToolCallContent, ToolCallId,
         ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
@@ -59,14 +59,15 @@ use codex_protocol::{
         ApplyPatchApprovalRequestEvent, DynamicToolCallResponseEvent, ElicitationAction,
         ErrorEvent, Event, EventMsg, ExecApprovalRequestEvent, ExecCommandBeginEvent,
         ExecCommandEndEvent, ExecCommandOutputDeltaEvent, ExecCommandStatus, ExitedReviewModeEvent,
-        FileChange, GuardianAssessmentEvent, GuardianAssessmentStatus, ItemCompletedEvent,
-        ItemStartedEvent, McpInvocation, McpStartupCompleteEvent, McpStartupUpdateEvent,
-        McpToolCallBeginEvent, McpToolCallEndEvent, ModelRerouteEvent, NetworkApprovalContext,
-        NetworkPolicyRuleAction, Op, PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus,
-        PatchApplyUpdatedEvent, ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent,
-        ReviewDecision, ReviewOutputEvent, ReviewRequest, ReviewTarget, RolloutItem,
-        StreamErrorEvent, TerminalInteractionEvent, ThreadGoalStatus, ThreadGoalUpdatedEvent,
-        TokenCountEvent, TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent, UserMessageEvent,
+        FileChange, GuardianAssessmentEvent, GuardianAssessmentStatus, ImageGenerationBeginEvent,
+        ImageGenerationEndEvent, ItemCompletedEvent, ItemStartedEvent, McpInvocation,
+        McpStartupCompleteEvent, McpStartupUpdateEvent, McpToolCallBeginEvent, McpToolCallEndEvent,
+        ModelRerouteEvent, NetworkApprovalContext, NetworkPolicyRuleAction, Op,
+        PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus, PatchApplyUpdatedEvent,
+        ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent, ReviewDecision,
+        ReviewOutputEvent, ReviewRequest, ReviewTarget, RolloutItem, StreamErrorEvent,
+        TerminalInteractionEvent, ThreadGoalStatus, ThreadGoalUpdatedEvent, TokenCountEvent,
+        TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent, UserMessageEvent,
         ViewImageToolCallEvent, WarningEvent, WebSearchBeginEvent, WebSearchEndEvent,
     },
     request_permissions::{
@@ -849,7 +850,7 @@ fn format_thread_goal_update(event: &ThreadGoalUpdatedEvent) -> String {
 }
 
 enum SubmissionState {
-    /// User prompts, including slash commands like /init, /review, /compact, /undo.
+    /// User prompts, including slash commands like /init, /review, /compact.
     Prompt(PromptState),
 }
 
@@ -909,6 +910,7 @@ struct PromptState {
     submission_id: String,
     active_commands: HashMap<String, ActiveCommand>,
     active_web_search: Option<String>,
+    active_image_generations: HashSet<String>,
     active_guardian_assessments: HashSet<String>,
     thread: Arc<dyn CodexThreadImpl>,
     resolution_tx: mpsc::UnboundedSender<ThreadMessage>,
@@ -935,6 +937,7 @@ impl PromptState {
             submission_id,
             active_commands: HashMap::new(),
             active_web_search: None,
+            active_image_generations: HashSet::new(),
             active_guardian_assessments: HashSet::new(),
             thread,
             resolution_tx,
@@ -1429,6 +1432,8 @@ impl PromptState {
             | EventMsg::WebSearchBegin(..)
             | EventMsg::UserMessage(..)
             | EventMsg::ExecApprovalRequest(..)
+            | EventMsg::ImageGenerationBegin(..)
+            | EventMsg::ImageGenerationEnd(..)
             | EventMsg::ExecCommandBegin(..)
             | EventMsg::ExecCommandOutputDelta(..)
             | EventMsg::ExecCommandEnd(..)
@@ -1474,7 +1479,7 @@ impl PromptState {
                         )));
                     }
             }
-            EventMsg::ItemStarted(ItemStartedEvent { thread_id, turn_id, item }) => {
+            EventMsg::ItemStarted(ItemStartedEvent { thread_id, turn_id, item , started_at_ms: _}) => {
                 info!("Item started with thread_id: {thread_id}, turn_id: {turn_id}, item: {item:?}");
             }
             EventMsg::UserMessage(UserMessageEvent {
@@ -1536,14 +1541,6 @@ impl PromptState {
                     client.send_agent_thought(text);
                 }
             }
-            EventMsg::ThreadNameUpdated(event) => {
-                info!("Thread name updated: {:?}", event.thread_name);
-                if let Some(title) = event.thread_name {
-                    client.send_notification(SessionUpdate::SessionInfoUpdate(
-                        SessionInfoUpdate::new().title(title),
-                    ));
-                }
-            }
             EventMsg::ThreadGoalUpdated(event) => {
                 info!("Thread goal updated: {:?}", event.goal.objective);
                 client.send_agent_text(format_thread_goal_update(&event));
@@ -1572,6 +1569,17 @@ impl PromptState {
                 self.update_web_search_query(client, call_id, query, action);
                 // The actual search results will come through AgentMessage events
                 // We mark as completed when a new tool call begins
+            }
+            EventMsg::ImageGenerationBegin(event) => {
+                info!("Image generation started: call_id={}", event.call_id);
+                self.start_image_generation(client, event);
+            }
+            EventMsg::ImageGenerationEnd(event) => {
+                info!(
+                    "Image generation ended: call_id={}, status={}",
+                    event.call_id, event.status
+                );
+                self.end_image_generation(client, event);
             }
             EventMsg::ExecApprovalRequest(event) => {
                 info!(
@@ -1608,7 +1616,7 @@ impl PromptState {
                 );
                 self.terminal_interaction(client, event);
             }
-            EventMsg::DynamicToolCallRequest(DynamicToolCallRequest { call_id, turn_id, namespace, tool, arguments }) => {
+            EventMsg::DynamicToolCallRequest(DynamicToolCallRequest { call_id, turn_id, namespace, tool, arguments, started_at_ms: _ }) => {
                 info!("Dynamic tool call request: call_id={call_id}, turn_id={turn_id}, namespace={namespace:?}, tool={tool}");
                 self.start_dynamic_tool_call(client, call_id, tool, arguments);
             }
@@ -1680,6 +1688,7 @@ impl PromptState {
                 thread_id,
                 turn_id,
                 item,
+                completed_at_ms: _,
             }) => {
                 info!("Item completed: thread_id={}, turn_id={}, item={:?}", thread_id, turn_id, item);
                 if let TurnItem::Plan(plan_item) = item {
@@ -1703,21 +1712,6 @@ impl PromptState {
                 if let Some(response_tx) = self.response_tx.take() {
                     response_tx.send(Ok(StopReason::EndTurn)).ok();
                 }
-            }
-            EventMsg::UndoStarted(event) => {
-                client.send_agent_text(
-                    event
-                        .message
-                        .unwrap_or_else(|| "Undo in progress...".to_string()),
-                );
-            }
-            EventMsg::UndoCompleted(event) => {
-                let fallback = if event.success {
-                    "Undo completed.".to_string()
-                } else {
-                    "Undo failed.".to_string()
-                };
-                client.send_agent_text(event.message.unwrap_or(fallback));
             }
             EventMsg::StreamError(StreamErrorEvent {
                 message,
@@ -1851,21 +1845,14 @@ impl PromptState {
             }
 
             // Ignore these events
-            EventMsg::ImageGenerationBegin(..)
-            | EventMsg::ImageGenerationEnd(..)
-            | EventMsg::AgentReasoningRawContent(..)
+            EventMsg::AgentReasoningRawContent(..)
             | EventMsg::ThreadRolledBack(..)
             | EventMsg::HookStarted(..)
             | EventMsg::HookCompleted(..)
             // we already have a way to diff the turn, so ignore
             | EventMsg::TurnDiff(..)
-            // Revisit when we can emit status updates
-            | EventMsg::BackgroundEvent(..)
             | EventMsg::SkillsUpdateAvailable
             // Old events
-            | EventMsg::AgentMessageDelta(..)
-            | EventMsg::AgentReasoningDelta(..)
-            | EventMsg::AgentReasoningRawContentDelta(..)
             | EventMsg::RawResponseItem(..)
             | EventMsg::SessionConfigured(..)
             // TODO: Subagent UI?
@@ -1884,11 +1871,7 @@ impl PromptState {
             | EventMsg::CollabCloseBegin(..)
             | EventMsg::CollabCloseEnd(..)
             | EventMsg::PlanDelta(..)=> {}
-            e @ (EventMsg::McpListToolsResponse(..)
-            | EventMsg::ListSkillsResponse(..)
-            | EventMsg::RealtimeConversationListVoicesResponse(..)
-            // Used for returning a single history entry
-            | EventMsg::GetHistoryEntryResponse(..)
+            e @ (EventMsg::RealtimeConversationListVoicesResponse(..)
             | EventMsg::DeprecationNotice(..)) => {
                 warn!("Unexpected event: {:?}", e);
             }
@@ -2179,6 +2162,7 @@ impl PromptState {
             turn_id: _,
             tool: _,
             arguments: _,
+            completed_at_ms: _,
             namespace: _,
             content_items,
             success,
@@ -2385,6 +2369,7 @@ impl PromptState {
             interaction_input: _,
             call_id,
             command: _,
+            started_at_ms: _,
             cwd,
             parsed_cmd,
             process_id: _,
@@ -2446,8 +2431,8 @@ impl PromptState {
         if let Some(active_command) = self.active_commands.get_mut(&call_id) {
             let data_str = String::from_utf8_lossy(&chunk).to_string();
 
-            let update = if client.supports_terminal_output(active_command) {
-                ToolCallUpdate::new(
+            if client.supports_terminal_output(active_command) {
+                let update = ToolCallUpdate::new(
                     active_command.tool_call_id.clone(),
                     ToolCallUpdateFields::new(),
                 )
@@ -2457,27 +2442,15 @@ impl PromptState {
                         "terminal_id": call_id,
                         "data": data_str
                     }),
-                )]))
+                )]));
+                client.send_tool_call_update(update);
             } else {
+                // Fallback path (no terminal_output capability): accumulate locally
+                // and emit a single ToolCallUpdate at exec_command_end. Resending the
+                // entire accumulated buffer per chunk is O(N²) memory and crashes the
+                // process on large outputs (issue #225).
                 active_command.output.push_str(&data_str);
-                let content = match active_command.file_extension.as_deref() {
-                    Some("md") => active_command.output.clone(),
-                    Some(ext) => format!(
-                        "```{ext}\n{}\n```\n",
-                        active_command.output.trim_end_matches('\n')
-                    ),
-                    None => format!(
-                        "```sh\n{}\n```\n",
-                        active_command.output.trim_end_matches('\n')
-                    ),
-                };
-                ToolCallUpdate::new(
-                    active_command.tool_call_id.clone(),
-                    ToolCallUpdateFields::new().content(vec![content.into()]),
-                )
-            };
-
-            client.send_tool_call_update(update);
+            }
         }
     }
 
@@ -2498,6 +2471,7 @@ impl PromptState {
             duration: _,
             formatted_output: _,
             process_id: _,
+            completed_at_ms: _,
             status,
         } = event;
         if let Some(active_command) = self.active_commands.remove(&call_id) {
@@ -2509,15 +2483,35 @@ impl PromptState {
                 ExecCommandStatus::Failed | ExecCommandStatus::Declined => ToolCallStatus::Failed,
             };
 
+            let supports_terminal = client.supports_terminal_output(&active_command);
+
+            let mut fields = ToolCallUpdateFields::new()
+                .status(status)
+                .raw_output(raw_output);
+
+            // For the non-terminal fallback path the per-chunk delta handler now
+            // accumulates silently (see exec_command_output_delta). Emit the full
+            // buffer here, exactly once, as a single content block. Skip the emission
+            // entirely when the command produced no output, so we don't surface an
+            // empty fenced code block to the client.
+            if !supports_terminal && !active_command.output.is_empty() {
+                let content = match active_command.file_extension.as_deref() {
+                    Some("md") => active_command.output.clone(),
+                    Some(ext) => format!(
+                        "```{ext}\n{}\n```\n",
+                        active_command.output.trim_end_matches('\n')
+                    ),
+                    None => format!(
+                        "```sh\n{}\n```\n",
+                        active_command.output.trim_end_matches('\n')
+                    ),
+                };
+                fields = fields.content(vec![content.into()]);
+            }
+
             client.send_tool_call_update(
-                ToolCallUpdate::new(
-                    active_command.tool_call_id.clone(),
-                    ToolCallUpdateFields::new()
-                        .status(status)
-                        .raw_output(raw_output),
-                )
-                .meta(client.supports_terminal_output(&active_command).then(
-                    || {
+                ToolCallUpdate::new(active_command.tool_call_id.clone(), fields).meta(
+                    supports_terminal.then(|| {
                         Meta::from_iter([(
                             "terminal_exit".into(),
                             serde_json::json!({
@@ -2526,8 +2520,8 @@ impl PromptState {
                                 "signal": null
                             }),
                         )])
-                    },
-                )),
+                    }),
+                ),
             );
         }
     }
@@ -2580,6 +2574,50 @@ impl PromptState {
     fn start_web_search(&mut self, client: &SessionClient, call_id: String) {
         self.active_web_search = Some(call_id.clone());
         client.send_tool_call(ToolCall::new(call_id, "Searching the Web").kind(ToolKind::Fetch));
+    }
+
+    fn start_image_generation(&mut self, client: &SessionClient, event: ImageGenerationBeginEvent) {
+        let raw_input = serde_json::json!(&event);
+        let ImageGenerationBeginEvent { call_id } = event;
+        self.active_image_generations.insert(call_id.clone());
+        client.send_tool_call(
+            ToolCall::new(call_id, "Image generation")
+                .kind(ToolKind::Other)
+                .status(ToolCallStatus::InProgress)
+                .raw_input(raw_input),
+        );
+    }
+
+    fn end_image_generation(&mut self, client: &SessionClient, event: ImageGenerationEndEvent) {
+        let raw_output = serde_json::json!(&event);
+        let ImageGenerationEndEvent {
+            call_id,
+            status,
+            revised_prompt,
+            result,
+            saved_path,
+        } = event;
+        let tool_status = image_generation_tool_status(&status);
+        let saved_path = saved_path.map(|path| path.to_string_lossy().into_owned());
+        let content = image_generation_content(revised_prompt, result, saved_path);
+
+        if self.active_image_generations.remove(&call_id) {
+            client.send_tool_call_update(ToolCallUpdate::new(
+                call_id,
+                ToolCallUpdateFields::new()
+                    .status(tool_status)
+                    .content(content)
+                    .raw_output(raw_output),
+            ));
+        } else {
+            client.send_tool_call(
+                ToolCall::new(call_id, "Image generation")
+                    .kind(ToolKind::Other)
+                    .status(tool_status)
+                    .content(content)
+                    .raw_output(raw_output),
+            );
+        }
     }
 
     fn update_web_search_query(
@@ -3357,7 +3395,6 @@ impl<A: Auth> ThreadActor<A> {
                 "compact",
                 "summarize conversation to prevent hitting the context limit",
             ),
-            AvailableCommand::new("undo", "undo Codex’s most recent turn"),
             AvailableCommand::new("logout", "logout of Codex"),
         ]
     }
@@ -3775,7 +3812,6 @@ impl<A: Auth> ThreadActor<A> {
         if let Some((name, rest)) = extract_slash_command(&items) {
             match name {
                 "compact" => op = Op::Compact,
-                "undo" => op = Op::Undo,
                 "init" => {
                     op = Op::UserInput {
                         items: vec![UserInput::Text {
@@ -4369,6 +4405,28 @@ impl<A: Auth> ThreadActor<A> {
                         .status(ToolCallStatus::Completed),
                 );
             }
+            ResponseItem::ImageGenerationCall {
+                id,
+                status,
+                revised_prompt,
+                result,
+            } => {
+                self.client.send_tool_call(
+                    ToolCall::new(id.clone(), "Image generation")
+                        .kind(ToolKind::Other)
+                        .status(image_generation_tool_status(status))
+                        .content(image_generation_content(
+                            revised_prompt.clone(),
+                            result.clone(),
+                            None,
+                        ))
+                        .raw_output(serde_json::json!({
+                            "status": status,
+                            "revised_prompt": revised_prompt,
+                            "result": result,
+                        })),
+                );
+            }
             // Skip GhostSnapshot, Compaction, Other, LocalShellCall without call_id
             _ => {}
         }
@@ -4729,6 +4787,45 @@ fn web_search_action_to_title_and_id(
     }
 }
 
+fn image_generation_tool_status(status: &str) -> ToolCallStatus {
+    match status {
+        "completed" => ToolCallStatus::Completed,
+        "generating" | "in_progress" | "incomplete" => ToolCallStatus::InProgress,
+        "failed" => ToolCallStatus::Failed,
+        _ => ToolCallStatus::Completed,
+    }
+}
+
+fn image_generation_content(
+    revised_prompt: Option<String>,
+    result: String,
+    saved_path: Option<String>,
+) -> Vec<ToolCallContent> {
+    let mut content = Vec::new();
+
+    if let Some(revised_prompt) = revised_prompt.filter(|prompt| !prompt.trim().is_empty()) {
+        content.push(ToolCallContent::Content(Content::new(ContentBlock::Text(
+            TextContent::new(format!("Revised prompt: {revised_prompt}")),
+        ))));
+    }
+
+    if !result.is_empty() {
+        let mut image = ImageContent::new(result, "image/png");
+        if let Some(saved_path) = saved_path
+            .as_ref()
+            .filter(|saved_path| !saved_path.trim().is_empty())
+        {
+            image = image.uri(saved_path.clone());
+        }
+
+        content.push(ToolCallContent::Content(Content::new(ContentBlock::Image(
+            image,
+        ))));
+    }
+
+    content
+}
+
 /// Generate a fallback ID using UUID (used when id is missing)
 fn generate_fallback_id(prefix: &str) -> String {
     format!("{}_{}", prefix, Uuid::new_v4())
@@ -4762,6 +4859,7 @@ fn extract_slash_command(content: &[UserInput]) -> Option<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
@@ -4829,6 +4927,83 @@ mod tests {
         }));
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_image_generation_emits_image_content() -> anyhow::Result<()> {
+        let (session_id, client, _, message_tx, _handle) = setup().await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+        let expected_uri = image_generation_test_saved_path()
+            .to_string_lossy()
+            .into_owned();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["image-generation".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        let stop_reason = prompt_response_rx.await??.await??;
+        assert_eq!(stop_reason, StopReason::EndTurn);
+        drop(message_tx);
+
+        let notifications = client.notifications.lock().unwrap();
+        let tool_call = notifications
+            .iter()
+            .find_map(|notification| match &notification.update {
+                SessionUpdate::ToolCall(tool_call)
+                    if tool_call.tool_call_id.0.as_ref() == "ig-1" =>
+                {
+                    Some(tool_call)
+                }
+                _ => None,
+            })
+            .expect("image generation tool call should be sent");
+        assert_eq!(tool_call.title, "Image generation");
+        assert_eq!(tool_call.status, ToolCallStatus::InProgress);
+
+        let update = notifications
+            .iter()
+            .find_map(|notification| match &notification.update {
+                SessionUpdate::ToolCallUpdate(update)
+                    if update.tool_call_id.0.as_ref() == "ig-1" =>
+                {
+                    Some(update)
+                }
+                _ => None,
+            })
+            .expect("image generation tool call update should be sent");
+        assert_eq!(update.fields.status, Some(ToolCallStatus::Completed));
+        let content = update
+            .fields
+            .content
+            .as_ref()
+            .expect("image generation update should include content");
+        assert_eq!(content.len(), 2);
+        assert!(matches!(
+            &content[0],
+            ToolCallContent::Content(Content {
+                content: ContentBlock::Text(TextContent { text, .. }),
+                ..
+            }) if text == "Revised prompt: A tiny blue square"
+        ));
+        assert!(matches!(
+            &content[1],
+            ToolCallContent::Content(Content {
+                content: ContentBlock::Image(ImageContent {
+                    data,
+                    mime_type,
+                    uri,
+                    ..
+                }),
+                ..
+            }) if data == "Zm9v" && mime_type == "image/png" && uri.as_deref() == Some(expected_uri.as_str())
+        ));
+
+        Ok(())
+    }
+
+    fn image_generation_test_saved_path() -> PathBuf {
+        std::env::temp_dir().join("ig-1.png")
     }
 
     #[tokio::test]
@@ -4952,47 +5127,6 @@ mod tests {
         assert!(!mode_trusts_project("read-only"));
         assert!(mode_trusts_project("auto"));
         assert!(mode_trusts_project("full-access"));
-    }
-
-    #[tokio::test]
-    async fn test_undo() -> anyhow::Result<()> {
-        let (session_id, client, thread, message_tx, _handle) = setup().await?;
-        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
-
-        message_tx.send(ThreadMessage::Prompt {
-            request: PromptRequest::new(session_id.clone(), vec!["/undo".into()]),
-            response_tx: prompt_response_tx,
-        })?;
-
-        let stop_reason = prompt_response_rx.await??.await??;
-        assert_eq!(stop_reason, StopReason::EndTurn);
-        drop(message_tx);
-
-        let notifications = client.notifications.lock().unwrap();
-        assert_eq!(
-            notifications.len(),
-            2,
-            "notifications don't match {notifications:?}"
-        );
-        assert!(matches!(
-            &notifications[0].update,
-            SessionUpdate::AgentMessageChunk(ContentChunk {
-                content: ContentBlock::Text(TextContent { text, .. }),
-                ..
-            }) if text == "Undo in progress..."
-        ));
-        assert!(matches!(
-            &notifications[1].update,
-            SessionUpdate::AgentMessageChunk(ContentChunk {
-                content: ContentBlock::Text(TextContent { text, .. }),
-                ..
-            }) if text == "Undo completed."
-        ));
-
-        let ops = thread.ops.lock().unwrap();
-        assert_eq!(ops.as_slice(), &[Op::Undo]);
-
-        Ok(())
     }
 
     #[tokio::test]
@@ -5860,6 +5994,7 @@ mod tests {
                                 }],
                                 source: Default::default(),
                                 interaction_input: None,
+                                started_at_ms: 0,
                             }));
                             send(EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
                                 call_id: "call-b".into(),
@@ -5872,6 +6007,7 @@ mod tests {
                                 }],
                                 source: Default::default(),
                                 interaction_input: None,
+                                started_at_ms: 0,
                             }));
                             send(EventMsg::ExecCommandEnd(ExecCommandEndEvent {
                                 call_id: "call-a".into(),
@@ -5889,6 +6025,7 @@ mod tests {
                                 duration: std::time::Duration::from_millis(10),
                                 formatted_output: "a\n".into(),
                                 status: ExecCommandStatus::Completed,
+                                completed_at_ms: 0,
                             }));
                             send(EventMsg::ExecCommandEnd(ExecCommandEndEvent {
                                 call_id: "call-b".into(),
@@ -5906,6 +6043,35 @@ mod tests {
                                 duration: std::time::Duration::from_millis(10),
                                 formatted_output: "b\n".into(),
                                 status: ExecCommandStatus::Completed,
+                                completed_at_ms: 0,
+                            }));
+                            send(EventMsg::TurnComplete(TurnCompleteEvent {
+                                last_agent_message: None,
+                                turn_id,
+                                completed_at: None,
+                                duration_ms: None,
+                                time_to_first_token_ms: None,
+                            }));
+                        } else if prompt == "image-generation" {
+                            let turn_id = id.to_string();
+                            let saved_path = image_generation_test_saved_path();
+                            let send = |msg| {
+                                self.op_tx
+                                    .send(Event {
+                                        id: id.to_string(),
+                                        msg,
+                                    })
+                                    .unwrap();
+                            };
+                            send(EventMsg::ImageGenerationBegin(ImageGenerationBeginEvent {
+                                call_id: "ig-1".into(),
+                            }));
+                            send(EventMsg::ImageGenerationEnd(ImageGenerationEndEvent {
+                                call_id: "ig-1".into(),
+                                status: "completed".into(),
+                                revised_prompt: Some("A tiny blue square".into()),
+                                result: "Zm9v".into(),
+                                saved_path: Some(saved_path.try_into()?),
                             }));
                             send(EventMsg::TurnComplete(TurnCompleteEvent {
                                 last_agent_message: None,
@@ -5996,6 +6162,7 @@ mod tests {
                                             id: "plan-item".to_string(),
                                             text: "- Step 1\n- Step 2\n".to_string(),
                                         }),
+                                        completed_at_ms: 0,
                                     }),
                                 })
                                 .unwrap();
@@ -6070,41 +6237,6 @@ mod tests {
                                     phase: None,
                                     memory_citation: None,
                                 }),
-                            })
-                            .unwrap();
-                        self.op_tx
-                            .send(Event {
-                                id: id.to_string(),
-                                msg: EventMsg::TurnComplete(TurnCompleteEvent {
-                                    last_agent_message: None,
-                                    turn_id: id.to_string(),
-                                    completed_at: None,
-                                    duration_ms: None,
-                                    time_to_first_token_ms: None,
-                                }),
-                            })
-                            .unwrap();
-                    }
-                    Op::Undo => {
-                        self.op_tx
-                            .send(Event {
-                                id: id.to_string(),
-                                msg: EventMsg::UndoStarted(
-                                    codex_protocol::protocol::UndoStartedEvent {
-                                        message: Some("Undo in progress...".to_string()),
-                                    },
-                                ),
-                            })
-                            .unwrap();
-                        self.op_tx
-                            .send(Event {
-                                id: id.to_string(),
-                                msg: EventMsg::UndoCompleted(
-                                    codex_protocol::protocol::UndoCompletedEvent {
-                                        success: true,
-                                        message: Some("Undo completed.".to_string()),
-                                    },
-                                ),
                             })
                             .unwrap();
                         self.op_tx
