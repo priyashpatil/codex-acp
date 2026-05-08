@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -7,7 +8,10 @@ use std::time::Duration;
 use agent_client_protocol::schema::{
     RequestPermissionResponse, SessionConfigKind, SessionConfigSelectOptions, TextContent,
 };
-use codex_core::{config::ConfigOverrides, test_support::all_model_presets};
+use codex_core::{
+    config::{Config, ConfigBuilder, ConfigOverrides},
+    test_support::all_model_presets,
+};
 use codex_protocol::{
     ThreadId,
     config_types::ModeKind,
@@ -329,6 +333,42 @@ async fn test_builtin_commands_include_debug_feedback_and_mention() -> anyhow::R
             "missing /{command}"
         );
     }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_load_publishes_skill_commands() -> anyhow::Result<()> {
+    let (_root, config) = config_with_skill("demo-skill", "Demo skill description").await?;
+    let (_session_id, client, _, message_tx, _handle) = setup_with_config(config).await?;
+    let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+
+    message_tx.send(ThreadMessage::Load { response_tx })?;
+    response_rx.await??;
+    drop(message_tx);
+
+    let command_names = available_command_names(&client);
+    assert!(
+        command_names.iter().any(|name| name == "skills:demo-skill"),
+        "missing demo skill command in {command_names:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_skills_update_available_reloads_skill_commands() -> anyhow::Result<()> {
+    let (root, config) = config_with_skill("first-skill", "First skill").await?;
+    let (_session_id, client, thread, message_tx, _handle) = setup_with_config(config).await?;
+    let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+
+    message_tx.send(ThreadMessage::Load { response_tx })?;
+    response_rx.await??;
+    write_test_skill(&root.join("codex-home"), "second-skill", "Second skill")?;
+    thread.emit_event(EventMsg::SkillsUpdateAvailable);
+
+    wait_for_available_command(&client, "skills:second-skill").await?;
+    drop(message_tx);
 
     Ok(())
 }
@@ -1219,6 +1259,75 @@ async fn test_plan_updates_do_not_regress_after_context_compaction() -> anyhow::
     Ok(())
 }
 
+async fn config_with_skill(name: &str, description: &str) -> anyhow::Result<(PathBuf, Config)> {
+    let root = std::env::temp_dir().join(format!("codex-acp-skills-{}", uuid::Uuid::new_v4()));
+    let codex_home = root.join("codex-home");
+    let cwd = root.join("workspace");
+    fs::create_dir_all(&codex_home)?;
+    fs::create_dir_all(&cwd)?;
+    fs::write(codex_home.join("config.toml"), "")?;
+    write_test_skill(&codex_home, name, description)?;
+
+    let config = ConfigBuilder::default()
+        .codex_home(codex_home)
+        .harness_overrides(ConfigOverrides {
+            cwd: Some(cwd),
+            ..Default::default()
+        })
+        .build()
+        .await?;
+
+    Ok((root, config))
+}
+
+fn write_test_skill(
+    codex_home: &std::path::Path,
+    name: &str,
+    description: &str,
+) -> std::io::Result<()> {
+    let skill_dir = codex_home.join("skills").join(name);
+    fs::create_dir_all(&skill_dir)?;
+    fs::write(
+        skill_dir.join("SKILL.md"),
+        format!("---\nname: {name}\ndescription: {description}\n---\n\n# {name}\n"),
+    )
+}
+
+fn available_command_names(client: &StubClient) -> Vec<String> {
+    client
+        .notifications
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|notification| match &notification.update {
+            SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate {
+                available_commands,
+                ..
+            }) => Some(available_commands),
+            _ => None,
+        })
+        .flat_map(|commands| commands.iter().map(|command| command.name.to_string()))
+        .collect()
+}
+
+async fn wait_for_available_command(client: &StubClient, name: &str) -> anyhow::Result<()> {
+    for _ in 0..20 {
+        let command_names = available_command_names(client);
+        if command_names
+            .iter()
+            .any(|command_name| command_name == name)
+        {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    anyhow::bail!(
+        "missing {name} command in {:?}",
+        available_command_names(client)
+    );
+}
+
 async fn setup() -> anyhow::Result<(
     SessionId,
     Arc<StubClient>,
@@ -1238,14 +1347,39 @@ async fn setup_with_client(
     UnboundedSender<ThreadMessage>,
     tokio::task::JoinHandle<()>,
 )> {
+    let config =
+        Config::load_with_cli_overrides_and_harness_overrides(vec![], ConfigOverrides::default())
+            .await?;
+    setup_with_client_and_config(client, config).await
+}
+
+async fn setup_with_config(
+    config: Config,
+) -> anyhow::Result<(
+    SessionId,
+    Arc<StubClient>,
+    Arc<StubCodexThread>,
+    UnboundedSender<ThreadMessage>,
+    tokio::task::JoinHandle<()>,
+)> {
+    setup_with_client_and_config(Arc::new(StubClient::new()), config).await
+}
+
+async fn setup_with_client_and_config(
+    client: Arc<StubClient>,
+    config: Config,
+) -> anyhow::Result<(
+    SessionId,
+    Arc<StubClient>,
+    Arc<StubCodexThread>,
+    UnboundedSender<ThreadMessage>,
+    tokio::task::JoinHandle<()>,
+)> {
     let session_id = SessionId::new(ThreadId::new().to_string());
     let session_client =
         SessionClient::with_client(session_id.clone(), client.clone(), Arc::default());
     let conversation = Arc::new(StubCodexThread::new());
     let models_manager = Arc::new(StubModelsManager);
-    let config =
-        Config::load_with_cli_overrides_and_harness_overrides(vec![], ConfigOverrides::default())
-            .await?;
     let (message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
     let (resolution_tx, resolution_rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -1347,6 +1481,15 @@ impl StubCodexThread {
             op_tx,
             op_rx: Mutex::new(op_rx),
         }
+    }
+
+    fn emit_event(&self, msg: EventMsg) {
+        self.op_tx
+            .send(Event {
+                id: "stub-event".to_string(),
+                msg,
+            })
+            .unwrap();
     }
 }
 

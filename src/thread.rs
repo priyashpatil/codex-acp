@@ -30,8 +30,10 @@ use codex_core::{
     config::{Config, set_project_trust_level},
     review_format::format_review_findings_block,
     review_prompts::user_facing_hint,
+    skills::{SkillsLoadInput, SkillsManager},
     util::normalize_thread_name,
 };
+use codex_exec_server::LOCAL_FS;
 use codex_login::auth::AuthManager;
 use codex_models_manager::manager::{ModelsManager, RefreshStrategy};
 use codex_protocol::{
@@ -75,10 +77,11 @@ use codex_protocol::{
         PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus, PatchApplyUpdatedEvent,
         PlanDeltaEvent, RawResponseItemEvent, ReasoningContentDeltaEvent,
         ReasoningRawContentDeltaEvent, ReviewDecision, ReviewOutputEvent, ReviewRequest,
-        ReviewTarget, RolloutItem, SkillMetadata, StreamErrorEvent, TerminalInteractionEvent,
-        ThreadGoalStatus, ThreadGoalUpdatedEvent, ThreadRolledBackEvent, TokenCountEvent,
-        TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent, UserMessageEvent,
-        ViewImageToolCallEvent, WarningEvent, WebSearchBeginEvent, WebSearchEndEvent,
+        ReviewTarget, RolloutItem, SkillDependencies, SkillInterface, SkillMetadata,
+        SkillToolDependency, StreamErrorEvent, TerminalInteractionEvent, ThreadGoalStatus,
+        ThreadGoalUpdatedEvent, ThreadRolledBackEvent, TokenCountEvent, TurnAbortedEvent,
+        TurnCompleteEvent, TurnStartedEvent, UserMessageEvent, ViewImageToolCallEvent,
+        WarningEvent, WebSearchBeginEvent, WebSearchEndEvent,
     },
     request_permissions::{
         PermissionGrantScope, RequestPermissionProfile, RequestPermissionsEvent,
@@ -256,6 +259,7 @@ enum ThreadMessage {
     Load {
         response_tx: oneshot::Sender<Result<LoadSessionResponse, Error>>,
     },
+    RefreshAvailableCommands,
     GetConfigOptions {
         response_tx: oneshot::Sender<Result<Vec<SessionConfigOption>, Error>>,
     },
@@ -3414,6 +3418,8 @@ struct ThreadActor<A> {
     models_manager: Arc<dyn ModelsManagerImpl>,
     /// Storage surface used for thread metadata updates.
     thread_name_store: Arc<dyn ThreadNameStore>,
+    /// Loader/cache for Codex skills available to this session.
+    skills_manager: Arc<SkillsManager>,
     /// Internal message sender used to route spawned interaction results back to the actor.
     resolution_tx: mpsc::UnboundedSender<ThreadMessage>,
     /// A sender for each interested `Op` submission that needs events routed.
@@ -3443,6 +3449,10 @@ impl<A: Auth> ThreadActor<A> {
         resolution_tx: mpsc::UnboundedSender<ThreadMessage>,
         resolution_rx: mpsc::UnboundedReceiver<ThreadMessage>,
     ) -> Self {
+        let skills_manager = Arc::new(SkillsManager::new(
+            config.codex_home.clone(),
+            config.bundled_skills_enabled(),
+        ));
         Self {
             auth,
             client,
@@ -3450,6 +3460,7 @@ impl<A: Auth> ThreadActor<A> {
             config,
             models_manager,
             thread_name_store,
+            skills_manager,
             resolution_tx,
             submissions: HashMap::new(),
             message_rx,
@@ -3494,9 +3505,13 @@ impl<A: Auth> ThreadActor<A> {
         match message {
             ThreadMessage::Load { response_tx } => {
                 let result = self.handle_load().await;
+                self.refresh_skills(false).await;
                 drop(response_tx.send(result));
                 self.send_available_commands_update();
                 self.send_available_commands_update_after_load();
+            }
+            ThreadMessage::RefreshAvailableCommands => {
+                self.send_available_commands_update();
             }
             ThreadMessage::GetConfigOptions { response_tx } => {
                 let result = self.config_options().await;
@@ -3593,14 +3608,37 @@ impl<A: Auth> ThreadActor<A> {
     }
 
     fn send_available_commands_update_after_load(&self) {
-        let client = self.client.clone();
-        let commands = self.available_commands();
+        let resolution_tx = self.resolution_tx.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(200)).await;
-            client.send_notification(SessionUpdate::AvailableCommandsUpdate(
-                AvailableCommandsUpdate::new(commands),
-            ));
+            drop(resolution_tx.send(ThreadMessage::RefreshAvailableCommands));
         });
+    }
+
+    async fn refresh_skills(&mut self, force_reload: bool) {
+        let input = SkillsLoadInput::new(
+            self.config.cwd.clone(),
+            Vec::new(),
+            self.config.config_layer_stack.clone(),
+            self.config.bundled_skills_enabled(),
+        );
+        let outcome = self
+            .skills_manager
+            .skills_for_cwd(&input, force_reload, Some(Arc::clone(&LOCAL_FS)))
+            .await;
+
+        for error in &outcome.errors {
+            warn!(
+                "failed to load Codex skill {}: {}",
+                error.path.display(),
+                error.message
+            );
+        }
+
+        self.skills = outcome
+            .skills_with_enabled()
+            .map(|(skill, enabled)| protocol_skill_metadata(skill, enabled))
+            .collect();
     }
 
     fn resolve_skill_command(&self, name: &str) -> Option<SkillMetadata> {
@@ -4998,6 +5036,7 @@ impl<A: Auth> ThreadActor<A> {
 
     async fn handle_event(&mut self, Event { id, msg }: Event) {
         if matches!(msg, EventMsg::SkillsUpdateAvailable) {
+            self.refresh_skills(true).await;
             self.send_available_commands_update();
             return;
         }
@@ -5030,6 +5069,54 @@ fn send_session_title_update(client: &SessionClient, title: Option<String>) {
         client.send_notification(SessionUpdate::SessionInfoUpdate(
             SessionInfoUpdate::new().title(title),
         ));
+    }
+}
+
+fn protocol_skill_metadata(
+    skill: &codex_core::skills::SkillMetadata,
+    enabled: bool,
+) -> SkillMetadata {
+    SkillMetadata {
+        name: skill.name.clone(),
+        description: skill.description.clone(),
+        short_description: skill.short_description.clone(),
+        interface: skill.interface.as_ref().map(protocol_skill_interface),
+        dependencies: skill.dependencies.as_ref().map(protocol_skill_dependencies),
+        path: skill.path_to_skills_md.clone(),
+        scope: skill.scope,
+        enabled,
+    }
+}
+
+fn protocol_skill_interface(
+    interface: &codex_core::skills::model::SkillInterface,
+) -> SkillInterface {
+    SkillInterface {
+        display_name: interface.display_name.clone(),
+        short_description: interface.short_description.clone(),
+        icon_small: interface.icon_small.clone(),
+        icon_large: interface.icon_large.clone(),
+        brand_color: interface.brand_color.clone(),
+        default_prompt: interface.default_prompt.clone(),
+    }
+}
+
+fn protocol_skill_dependencies(
+    dependencies: &codex_core::skills::model::SkillDependencies,
+) -> SkillDependencies {
+    SkillDependencies {
+        tools: dependencies
+            .tools
+            .iter()
+            .map(|tool| SkillToolDependency {
+                r#type: tool.r#type.clone(),
+                value: tool.value.clone(),
+                description: tool.description.clone(),
+                transport: tool.transport.clone(),
+                command: tool.command.clone(),
+                url: tool.url.clone(),
+            })
+            .collect(),
     }
 }
 
