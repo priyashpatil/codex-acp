@@ -1334,6 +1334,69 @@ impl CodexThreadImpl for StubCodexThread {
                             duration_ms: None,
                             time_to_first_token_ms: None,
                         }));
+                    } else if prompt == "chunked-exec" {
+                        let turn_id = id.to_string();
+                        let cwd = std::env::current_dir().unwrap();
+                        let send = |msg| {
+                            self.op_tx
+                                .send(Event {
+                                    id: id.to_string(),
+                                    msg,
+                                })
+                                .unwrap();
+                        };
+                        send(EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
+                            call_id: "chunked".into(),
+                            process_id: None,
+                            turn_id: turn_id.clone(),
+                            command: vec!["echo".into(), "chunked".into()],
+                            cwd: cwd.clone().try_into()?,
+                            parsed_cmd: vec![ParsedCommand::Unknown {
+                                cmd: "echo chunked".into(),
+                            }],
+                            source: Default::default(),
+                            interaction_input: None,
+                            started_at_ms: 0,
+                        }));
+                        send(EventMsg::ExecCommandOutputDelta(
+                            ExecCommandOutputDeltaEvent {
+                                call_id: "chunked".to_string(),
+                                stream: codex_protocol::protocol::ExecOutputStream::Stdout,
+                                chunk: b"first\n".to_vec(),
+                            },
+                        ));
+                        send(EventMsg::ExecCommandOutputDelta(
+                            ExecCommandOutputDeltaEvent {
+                                call_id: "chunked".to_string(),
+                                stream: codex_protocol::protocol::ExecOutputStream::Stdout,
+                                chunk: b"second\n".to_vec(),
+                            },
+                        ));
+                        send(EventMsg::ExecCommandEnd(ExecCommandEndEvent {
+                            call_id: "chunked".into(),
+                            process_id: None,
+                            turn_id: turn_id.clone(),
+                            command: vec!["echo".into(), "chunked".into()],
+                            cwd: cwd.clone().try_into()?,
+                            parsed_cmd: vec![],
+                            source: Default::default(),
+                            interaction_input: None,
+                            stdout: "first\nsecond\n".into(),
+                            stderr: String::new(),
+                            aggregated_output: "first\nsecond\n".into(),
+                            exit_code: 0,
+                            duration: std::time::Duration::from_millis(10),
+                            formatted_output: "first\nsecond\n".into(),
+                            status: ExecCommandStatus::Completed,
+                            completed_at_ms: 0,
+                        }));
+                        send(EventMsg::TurnComplete(TurnCompleteEvent {
+                            last_agent_message: None,
+                            turn_id,
+                            completed_at: None,
+                            duration_ms: None,
+                            time_to_first_token_ms: None,
+                        }));
                     } else if prompt == "thread-goal-update" {
                         let turn_id = id.to_string();
                         let thread_id = ThreadId::default();
@@ -2952,6 +3015,56 @@ async fn test_blocked_approval_does_not_block_followup_events() -> anyhow::Resul
 
     drop(notifications);
     prompt_state.abort_pending_interactions();
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_non_terminal_exec_output_emits_content_once() -> anyhow::Result<()> {
+    let (session_id, client, _, message_tx, _handle) = setup().await?;
+    let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+    message_tx.send(ThreadMessage::Prompt {
+        request: PromptRequest::new(session_id.clone(), vec!["chunked-exec".into()]),
+        response_tx: prompt_response_tx,
+    })?;
+
+    let stop_reason = prompt_response_rx.await??.await??;
+    assert_eq!(stop_reason, StopReason::EndTurn);
+    drop(message_tx);
+
+    let notifications = client.notifications.lock().unwrap();
+    let content_updates = notifications
+        .iter()
+        .filter_map(|notification| match &notification.update {
+            SessionUpdate::ToolCallUpdate(update)
+                if update.tool_call_id.0.as_ref() == "chunked"
+                    && update.fields.content.is_some() =>
+            {
+                Some(update)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        content_updates.len(),
+        1,
+        "non-terminal exec output should be emitted once at command end"
+    );
+    assert!(matches!(
+        content_updates[0].fields.content.as_deref(),
+        Some([
+            ToolCallContent::Content(Content {
+                content: ContentBlock::Text(TextContent { text, .. }),
+                ..
+            })
+        ]) if text == "```sh\nfirst\nsecond\n```\n"
+    ));
+    assert_eq!(
+        content_updates[0].fields.status,
+        Some(ToolCallStatus::Completed)
+    );
 
     Ok(())
 }
