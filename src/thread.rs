@@ -4,6 +4,7 @@ use std::{
     path::PathBuf,
     pin::Pin,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use agent_client_protocol::{
@@ -3495,6 +3496,7 @@ impl<A: Auth> ThreadActor<A> {
                 let result = self.handle_load().await;
                 drop(response_tx.send(result));
                 self.send_available_commands_update();
+                self.send_available_commands_update_after_load();
             }
             ThreadMessage::GetConfigOptions { response_tx } => {
                 let result = self.config_options().await;
@@ -3588,6 +3590,17 @@ impl<A: Auth> ThreadActor<A> {
             .send_notification(SessionUpdate::AvailableCommandsUpdate(
                 AvailableCommandsUpdate::new(self.available_commands()),
             ));
+    }
+
+    fn send_available_commands_update_after_load(&self) {
+        let client = self.client.clone();
+        let commands = self.available_commands();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            client.send_notification(SessionUpdate::AvailableCommandsUpdate(
+                AvailableCommandsUpdate::new(commands),
+            ));
+        });
     }
 
     fn resolve_skill_command(&self, name: &str) -> Option<SkillMetadata> {
