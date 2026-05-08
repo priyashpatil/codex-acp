@@ -46,6 +46,34 @@ async fn test_prompt() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn test_rename_sends_title_update() -> anyhow::Result<()> {
+    let (session_id, client, thread, message_tx, _handle) = setup().await?;
+    let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+    message_tx.send(ThreadMessage::Prompt {
+        request: PromptRequest::new(session_id.clone(), vec!["/rename My New Thread".into()]),
+        response_tx: prompt_response_tx,
+    })?;
+
+    let stop_reason = prompt_response_rx.await??.await??;
+    assert_eq!(stop_reason, StopReason::EndTurn);
+    drop(message_tx);
+
+    assert!(thread.ops.lock().unwrap().is_empty());
+
+    let notifications = client.notifications.lock().unwrap();
+    assert!(notifications.iter().any(|notification| {
+        matches!(
+            &notification.update,
+            SessionUpdate::SessionInfoUpdate(update)
+                if update.title.value() == Some(&"My New Thread".to_string())
+        )
+    }));
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_thread_goal_updated_is_sent_as_agent_message() -> anyhow::Result<()> {
     let (session_id, client, _, message_tx, _handle) = setup().await?;
     let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
@@ -1210,7 +1238,7 @@ async fn setup_with_client(
     UnboundedSender<ThreadMessage>,
     tokio::task::JoinHandle<()>,
 )> {
-    let session_id = SessionId::new("test");
+    let session_id = SessionId::new(ThreadId::new().to_string());
     let session_client =
         SessionClient::with_client(session_id.clone(), client.clone(), Arc::default());
     let conversation = Arc::new(StubCodexThread::new());
@@ -1226,6 +1254,7 @@ async fn setup_with_client(
         session_client,
         conversation.clone(),
         models_manager,
+        Arc::new(StubThreadNameStore::default()),
         config,
         message_rx,
         resolution_tx,
@@ -1241,6 +1270,24 @@ struct StubAuth;
 impl Auth for StubAuth {
     async fn logout(&self) -> Result<bool, Error> {
         Ok(true)
+    }
+}
+
+#[derive(Default)]
+struct StubThreadNameStore {
+    updates: std::sync::Mutex<Vec<(ThreadId, String)>>,
+}
+
+impl ThreadNameStore for StubThreadNameStore {
+    fn update_thread_name(
+        &self,
+        thread_id: ThreadId,
+        name: String,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>> {
+        Box::pin(async move {
+            self.updates.lock().unwrap().push((thread_id, name));
+            Ok(())
+        })
     }
 }
 
@@ -3203,6 +3250,7 @@ async fn test_thread_shutdown_bypasses_blocked_permission_request() -> anyhow::R
         session_client,
         conversation.clone(),
         models_manager,
+        Arc::new(StubThreadNameStore::default()),
         config,
         message_rx,
         resolution_tx,

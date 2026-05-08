@@ -79,6 +79,10 @@ impl SessionClient {
                 })
     }
 
+    pub(super) fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
     pub(super) fn send_notification(&self, update: SessionUpdate) {
         if let Err(e) = self
             .client

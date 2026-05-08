@@ -590,11 +590,13 @@ impl CodexAgent {
             .lock()
             .unwrap()
             .insert(session_id.clone(), config.cwd.to_path_buf());
+        let thread_store = thread_store_from_config(&config, self.state_db.clone());
         let thread = Arc::new(Thread::new(
             session_id.clone(),
             thread,
             self.auth_manager.clone(),
             Arc::new(self.thread_manager.get_models_manager()),
+            thread_store,
             self.client_capabilities.clone(),
             config.clone(),
             cx,
@@ -664,11 +666,13 @@ impl CodexAgent {
         .await
         .map_err(|e| Error::internal_error().data(e.to_string()))?;
 
+        let thread_store = thread_store_from_config(&config, self.state_db.clone());
         let thread = Arc::new(Thread::new(
             session_id.clone(),
             thread,
             self.auth_manager.clone(),
             Arc::new(self.thread_manager.get_models_manager()),
+            thread_store,
             self.client_capabilities.clone(),
             config.clone(),
             cx,
@@ -739,11 +743,13 @@ impl CodexAgent {
             .unwrap()
             .insert(new_session_id.clone(), config.cwd.to_path_buf());
 
+        let thread_store = thread_store_from_config(&config, self.state_db.clone());
         let thread = Arc::new(Thread::new(
             new_session_id.clone(),
             thread,
             self.auth_manager.clone(),
             Arc::new(self.thread_manager.get_models_manager()),
+            thread_store,
             self.client_capabilities.clone(),
             config,
             cx,

@@ -29,10 +29,12 @@ use codex_core::{
     config::{Config, set_project_trust_level},
     review_format::format_review_findings_block,
     review_prompts::user_facing_hint,
+    util::normalize_thread_name,
 };
 use codex_login::auth::AuthManager;
 use codex_models_manager::manager::{ModelsManager, RefreshStrategy};
 use codex_protocol::{
+    ThreadId,
     approvals::{
         ElicitationRequest, ElicitationRequestEvent, GuardianAssessmentAction,
         GuardianCommandSource,
@@ -88,6 +90,7 @@ use codex_protocol::{
     user_input::UserInput,
 };
 use codex_shell_command::parse_command::parse_command;
+use codex_thread_store::{ThreadMetadataPatch, ThreadStore, UpdateThreadMetadataParams};
 use codex_utils_approval_presets::{ApprovalPreset, builtin_approval_presets};
 use heck::ToTitleCase;
 use itertools::Itertools;
@@ -194,6 +197,47 @@ impl ModelsManagerImpl for Arc<dyn ModelsManager> {
     }
 }
 
+trait ThreadNameStore: Send + Sync {
+    fn update_thread_name(
+        &self,
+        thread_id: ThreadId,
+        name: String,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>>;
+}
+
+struct ThreadStoreNameUpdater {
+    thread_store: Arc<dyn ThreadStore>,
+}
+
+impl ThreadStoreNameUpdater {
+    fn new(thread_store: Arc<dyn ThreadStore>) -> Self {
+        Self { thread_store }
+    }
+}
+
+impl ThreadNameStore for ThreadStoreNameUpdater {
+    fn update_thread_name(
+        &self,
+        thread_id: ThreadId,
+        name: String,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>> {
+        Box::pin(async move {
+            self.thread_store
+                .update_thread_metadata(UpdateThreadMetadataParams {
+                    thread_id,
+                    patch: ThreadMetadataPatch {
+                        name: Some(name),
+                        ..Default::default()
+                    },
+                    include_archived: false,
+                })
+                .await
+                .map_err(|err| Error::internal_error().data(err.to_string()))?;
+            Ok(())
+        })
+    }
+}
+
 pub trait Auth {
     fn logout(&self) -> impl Future<Output = Result<bool, Error>> + Send;
 }
@@ -267,6 +311,7 @@ impl Thread {
         thread: Arc<dyn CodexThreadImpl>,
         auth: Arc<AuthManager>,
         models_manager: Arc<dyn ModelsManagerImpl>,
+        thread_store: Arc<dyn ThreadStore>,
         client_capabilities: Arc<Mutex<ClientCapabilities>>,
         config: Config,
         cx: ConnectionTo<Client>,
@@ -279,6 +324,7 @@ impl Thread {
             SessionClient::new(session_id, cx, client_capabilities),
             thread.clone(),
             models_manager,
+            Arc::new(ThreadStoreNameUpdater::new(thread_store)),
             config,
             message_rx,
             resolution_tx,
@@ -3365,6 +3411,8 @@ struct ThreadActor<A> {
     config: Config,
     /// The models available for this thread.
     models_manager: Arc<dyn ModelsManagerImpl>,
+    /// Storage surface used for thread metadata updates.
+    thread_name_store: Arc<dyn ThreadNameStore>,
     /// Internal message sender used to route spawned interaction results back to the actor.
     resolution_tx: mpsc::UnboundedSender<ThreadMessage>,
     /// A sender for each interested `Op` submission that needs events routed.
@@ -3388,6 +3436,7 @@ impl<A: Auth> ThreadActor<A> {
         client: SessionClient,
         thread: Arc<dyn CodexThreadImpl>,
         models_manager: Arc<dyn ModelsManagerImpl>,
+        thread_name_store: Arc<dyn ThreadNameStore>,
         config: Config,
         message_rx: mpsc::UnboundedReceiver<ThreadMessage>,
         resolution_tx: mpsc::UnboundedSender<ThreadMessage>,
@@ -3399,6 +3448,7 @@ impl<A: Auth> ThreadActor<A> {
             thread,
             config,
             models_manager,
+            thread_name_store,
             resolution_tx,
             submissions: HashMap::new(),
             message_rx,
@@ -4182,6 +4232,12 @@ impl<A: Auth> ThreadActor<A> {
                         self.auth.logout().await?;
                         return Err(Error::auth_required());
                     }
+                    "rename" if !rest.is_empty() => {
+                        let name = normalize_thread_name(rest).ok_or_else(Error::invalid_params)?;
+                        self.handle_rename(name).await?;
+                        drop(response_tx.send(Ok(StopReason::EndTurn)));
+                        return Ok(response_rx);
+                    }
                     "fast" => {
                         let tier = match rest.trim().to_ascii_lowercase().as_str() {
                             "" => {
@@ -4312,6 +4368,18 @@ impl<A: Auth> ThreadActor<A> {
         self.submissions.insert(submission_id, state);
 
         Ok(response_rx)
+    }
+
+    async fn handle_rename(&mut self, name: String) -> Result<(), Error> {
+        let thread_id = ThreadId::from_string(self.client.session_id().0.as_ref())
+            .map_err(|err| Error::internal_error().data(err.to_string()))?;
+        self.thread_name_store
+            .update_thread_name(thread_id, name.clone())
+            .await?;
+        send_session_title_update(&self.client, Some(name.clone()));
+        self.client
+            .send_agent_text(format!("Thread renamed to: {name}\n"));
+        Ok(())
     }
 
     async fn submit_plan_implementation(

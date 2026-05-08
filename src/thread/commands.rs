@@ -31,6 +31,9 @@ pub(super) fn builtin_commands() -> Vec<AvailableCommand> {
             "compact",
             "summarize conversation to prevent hitting the context limit",
         ),
+        AvailableCommand::new("rename", "rename the current thread").input(
+            AvailableCommandInput::Unstructured(UnstructuredCommandInput::new("new name")),
+        ),
         AvailableCommand::new("logout", "logout of Codex"),
         AvailableCommand::new("fast", "toggle fast mode for this session").input(
             AvailableCommandInput::Unstructured(UnstructuredCommandInput::new(

@@ -1534,6 +1534,7 @@ dependencies = [
  "codex-models-manager",
  "codex-protocol",
  "codex-shell-command",
+ "codex-thread-store",
  "codex-utils-approval-presets",
  "codex-utils-cli",
  "diffy",
