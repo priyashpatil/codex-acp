@@ -1,5 +1,4 @@
 use std::collections::VecDeque;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
@@ -11,7 +10,7 @@ use codex_core::{config::ConfigOverrides, test_support::all_model_presets};
 use codex_protocol::{
     ThreadId,
     config_types::ModeKind,
-    protocol::{CollabAgentRef, CollabAgentStatusEntry, ThreadGoal, ThreadNameUpdatedEvent},
+    protocol::{CollabAgentRef, CollabAgentStatusEntry, ThreadGoal},
     request_user_input::RequestUserInputQuestionOption,
 };
 use tokio::sync::{Mutex, Notify, mpsc::UnboundedSender};
@@ -201,68 +200,6 @@ async fn test_compact() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn test_rename_sends_title_update() -> anyhow::Result<()> {
-    let (session_id, client, thread, message_tx, _handle) = setup().await?;
-    let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
-
-    message_tx.send(ThreadMessage::Prompt {
-        request: PromptRequest::new(session_id.clone(), vec!["/rename My New Thread".into()]),
-        response_tx: prompt_response_tx,
-    })?;
-
-    let stop_reason = prompt_response_rx.await??.await??;
-    assert_eq!(stop_reason, StopReason::EndTurn);
-    drop(message_tx);
-
-    let ops = thread.ops.lock().unwrap();
-    assert!(matches!(
-        ops.as_slice(),
-        [Op::SetThreadName { name }] if name == "My New Thread"
-    ));
-
-    let notifications = client.notifications.lock().unwrap();
-    assert!(notifications.iter().any(|notification| {
-        matches!(
-            &notification.update,
-            SessionUpdate::SessionInfoUpdate(update)
-                if update.title.value() == Some(&"My New Thread".to_string())
-        )
-    }));
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_replay_thread_name_sends_title_update() -> anyhow::Result<()> {
-    let (_session_id, client, _, message_tx, _handle) = setup().await?;
-    let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-
-    message_tx.send(ThreadMessage::ReplayHistory {
-        history: vec![RolloutItem::EventMsg(EventMsg::ThreadNameUpdated(
-            ThreadNameUpdatedEvent {
-                thread_id: ThreadId::new(),
-                thread_name: Some("Persisted Thread Name".to_string()),
-            },
-        ))],
-        response_tx,
-    })?;
-
-    response_rx.await??;
-    drop(message_tx);
-
-    let notifications = client.notifications.lock().unwrap();
-    assert!(notifications.iter().any(|notification| {
-        matches!(
-            &notification.update,
-            SessionUpdate::SessionInfoUpdate(update)
-                if update.title.value() == Some(&"Persisted Thread Name".to_string())
-        )
-    }));
-
-    Ok(())
-}
-
-#[tokio::test]
 async fn test_builtin_commands_include_debug_feedback_and_mention() -> anyhow::Result<()> {
     let (_session_id, client, _, message_tx, _handle) = setup().await?;
     let (response_tx, response_rx) = tokio::sync::oneshot::channel();
@@ -431,47 +368,6 @@ fn read_only_mode_does_not_trust_project() {
     assert!(!mode_trusts_project("read-only"));
     assert!(mode_trusts_project("auto"));
     assert!(mode_trusts_project("full-access"));
-}
-
-#[tokio::test]
-async fn test_undo() -> anyhow::Result<()> {
-    let (session_id, client, thread, message_tx, _handle) = setup().await?;
-    let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
-
-    message_tx.send(ThreadMessage::Prompt {
-        request: PromptRequest::new(session_id.clone(), vec!["/undo".into()]),
-        response_tx: prompt_response_tx,
-    })?;
-
-    let stop_reason = prompt_response_rx.await??.await??;
-    assert_eq!(stop_reason, StopReason::EndTurn);
-    drop(message_tx);
-
-    let notifications = client.notifications.lock().unwrap();
-    assert_eq!(
-        notifications.len(),
-        2,
-        "notifications don't match {notifications:?}"
-    );
-    assert!(matches!(
-        &notifications[0].update,
-        SessionUpdate::AgentMessageChunk(ContentChunk {
-            content: ContentBlock::Text(TextContent { text, .. }),
-            ..
-        }) if text == "Undo in progress..."
-    ));
-    assert!(matches!(
-        &notifications[1].update,
-        SessionUpdate::AgentMessageChunk(ContentChunk {
-            content: ContentBlock::Text(TextContent { text, .. }),
-            ..
-        }) if text == "Undo completed."
-    ));
-
-    let ops = thread.ops.lock().unwrap();
-    assert_eq!(ops.as_slice(), &[Op::Undo]);
-
-    Ok(())
 }
 
 #[tokio::test]
@@ -699,232 +595,6 @@ async fn test_branch_review() -> anyhow::Result<()> {
         }],
         "ops don't match {ops:?}"
     );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_load_publishes_skills_as_namespaced_commands() -> anyhow::Result<()> {
-    let skill = SkillMetadata {
-        name: "demo".to_string(),
-        description: "Demo skill".to_string(),
-        short_description: None,
-        interface: None,
-        dependencies: None,
-        path: PathBuf::from("/tmp/demo/SKILL.md").try_into()?,
-        scope: codex_protocol::protocol::SkillScope::Repo,
-        enabled: true,
-    };
-    let (_session_id, client, _thread, message_tx, handle) = setup_with_skills(vec![skill]).await?;
-    let (load_response_tx, load_response_rx) = tokio::sync::oneshot::channel();
-
-    message_tx.send(ThreadMessage::Load {
-        response_tx: load_response_tx,
-    })?;
-
-    drop(load_response_rx.await??);
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    drop(message_tx);
-    handle.await?;
-
-    let notifications = client.notifications.lock().unwrap();
-    assert!(notifications.iter().any(|notification| matches!(
-        &notification.update,
-        SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate { available_commands, .. })
-            if available_commands.iter().any(|command| command.name == "skills:demo")
-    )));
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_load_does_not_publish_disabled_skills() -> anyhow::Result<()> {
-    let skill = SkillMetadata {
-        name: "disabled-demo".to_string(),
-        description: "Disabled demo skill".to_string(),
-        short_description: None,
-        interface: None,
-        dependencies: None,
-        path: PathBuf::from("/tmp/disabled-demo/SKILL.md").try_into()?,
-        scope: codex_protocol::protocol::SkillScope::Repo,
-        enabled: false,
-    };
-    let (_session_id, client, _thread, message_tx, handle) = setup_with_skills(vec![skill]).await?;
-    let (load_response_tx, load_response_rx) = tokio::sync::oneshot::channel();
-
-    message_tx.send(ThreadMessage::Load {
-        response_tx: load_response_tx,
-    })?;
-
-    drop(load_response_rx.await??);
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    drop(message_tx);
-    handle.await?;
-
-    let notifications = client.notifications.lock().unwrap();
-    assert!(
-        notifications
-            .iter()
-            .all(|notification| match &notification.update {
-                SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate {
-                    available_commands,
-                    ..
-                }) => {
-                    !available_commands
-                        .iter()
-                        .any(|command| command.name == "skills:disabled-demo")
-                }
-                _ => true,
-            })
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_load_does_not_publish_skills_for_other_cwd() -> anyhow::Result<()> {
-    let skill = SkillMetadata {
-        name: "other-cwd".to_string(),
-        description: "Other cwd skill".to_string(),
-        short_description: None,
-        interface: None,
-        dependencies: None,
-        path: PathBuf::from("/tmp/other-cwd/SKILL.md").try_into()?,
-        scope: codex_protocol::protocol::SkillScope::Repo,
-        enabled: true,
-    };
-    let (_session_id, client, thread, message_tx, handle) = setup_with_skills(vec![skill]).await?;
-    thread.skills_entries.lock().unwrap()[0].cwd = PathBuf::from("/tmp/not-the-session-cwd");
-    let (load_response_tx, load_response_rx) = tokio::sync::oneshot::channel();
-
-    message_tx.send(ThreadMessage::Load {
-        response_tx: load_response_tx,
-    })?;
-
-    drop(load_response_rx.await??);
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    drop(message_tx);
-    handle.await?;
-
-    let notifications = client.notifications.lock().unwrap();
-    assert!(
-        notifications
-            .iter()
-            .all(|notification| match &notification.update {
-                SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate {
-                    available_commands,
-                    ..
-                }) => {
-                    !available_commands
-                        .iter()
-                        .any(|command| command.name == "skills:other-cwd")
-                }
-                _ => true,
-            })
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_skill_command_creates_skill_user_input() -> anyhow::Result<()> {
-    let skill = SkillMetadata {
-        name: "demo".to_string(),
-        description: "Demo skill".to_string(),
-        short_description: None,
-        interface: None,
-        dependencies: None,
-        path: PathBuf::from("/tmp/demo/SKILL.md").try_into()?,
-        scope: codex_protocol::protocol::SkillScope::Repo,
-        enabled: true,
-    };
-    let (session_id, _client, thread, message_tx, handle) =
-        setup_with_skills(vec![skill.clone()]).await?;
-    let (load_response_tx, load_response_rx) = tokio::sync::oneshot::channel();
-    message_tx.send(ThreadMessage::Load {
-        response_tx: load_response_tx,
-    })?;
-    drop(load_response_rx.await??);
-    tokio::time::sleep(Duration::from_millis(20)).await;
-
-    let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
-    message_tx.send(ThreadMessage::Prompt {
-        request: PromptRequest::new(session_id.clone(), vec!["/skills:demo use it well".into()]),
-        response_tx: prompt_response_tx,
-    })?;
-
-    let stop_reason = prompt_response_rx.await??.await??;
-    assert_eq!(stop_reason, StopReason::EndTurn);
-    drop(message_tx);
-    handle.await?;
-
-    let ops = thread.ops.lock().unwrap();
-    let skill_input = ops
-        .iter()
-        .find_map(|op| match op {
-            Op::UserInput { items, .. } => Some(items),
-            _ => None,
-        })
-        .expect("expected user input op");
-
-    assert!(skill_input.iter().any(|item| matches!(
-        item,
-        UserInput::Skill { name, path } if name == "demo" && path == &skill.path.to_path_buf()
-    )));
-    assert!(skill_input.iter().any(|item| matches!(
-        item,
-        UserInput::Text { text, .. } if text == "use it well"
-    )));
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_skills_update_available_refreshes_commands() -> anyhow::Result<()> {
-    let initial_skill = SkillMetadata {
-        name: "demo".to_string(),
-        description: "Demo skill".to_string(),
-        short_description: None,
-        interface: None,
-        dependencies: None,
-        path: PathBuf::from("/tmp/demo/SKILL.md").try_into()?,
-        scope: codex_protocol::protocol::SkillScope::Repo,
-        enabled: true,
-    };
-    let refreshed_skill = SkillMetadata {
-        name: "second".to_string(),
-        description: "Second skill".to_string(),
-        short_description: None,
-        interface: None,
-        dependencies: None,
-        path: PathBuf::from("/tmp/second/SKILL.md").try_into()?,
-        scope: codex_protocol::protocol::SkillScope::Repo,
-        enabled: true,
-    };
-    let (_session_id, client, thread, message_tx, handle) =
-        setup_with_skills(vec![initial_skill]).await?;
-    let (load_response_tx, load_response_rx) = tokio::sync::oneshot::channel();
-
-    message_tx.send(ThreadMessage::Load {
-        response_tx: load_response_tx,
-    })?;
-
-    drop(load_response_rx.await??);
-    thread.skills_entries.lock().unwrap()[0].skills = vec![refreshed_skill];
-    thread.op_tx.send(Event {
-        id: "skill-update".to_string(),
-        msg: EventMsg::SkillsUpdateAvailable,
-    })?;
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    drop(message_tx);
-    handle.await?;
-
-    let notifications = client.notifications.lock().unwrap();
-    assert!(notifications.iter().any(|notification| matches!(
-        &notification.update,
-        SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate { available_commands, .. })
-            if available_commands.iter().any(|command| command.name == "skills:second")
-    )));
 
     Ok(())
 }
@@ -1466,31 +1136,6 @@ async fn setup_with_client(
     UnboundedSender<ThreadMessage>,
     tokio::task::JoinHandle<()>,
 )> {
-    setup_with_client_and_skills(client, Vec::new()).await
-}
-
-async fn setup_with_skills(
-    skills: Vec<SkillMetadata>,
-) -> anyhow::Result<(
-    SessionId,
-    Arc<StubClient>,
-    Arc<StubCodexThread>,
-    UnboundedSender<ThreadMessage>,
-    tokio::task::JoinHandle<()>,
-)> {
-    setup_with_client_and_skills(Arc::new(StubClient::new()), skills).await
-}
-
-async fn setup_with_client_and_skills(
-    client: Arc<StubClient>,
-    skills: Vec<SkillMetadata>,
-) -> anyhow::Result<(
-    SessionId,
-    Arc<StubClient>,
-    Arc<StubCodexThread>,
-    UnboundedSender<ThreadMessage>,
-    tokio::task::JoinHandle<()>,
-)> {
     let session_id = SessionId::new("test");
     let session_client =
         SessionClient::with_client(session_id.clone(), client.clone(), Arc::default());
@@ -1499,15 +1144,6 @@ async fn setup_with_client_and_skills(
     let config =
         Config::load_with_cli_overrides_and_harness_overrides(vec![], ConfigOverrides::default())
             .await?;
-    conversation
-        .skills_entries
-        .lock()
-        .unwrap()
-        .push(SkillsListEntry {
-            cwd: config.cwd.clone().to_path_buf(),
-            skills,
-            errors: Vec::new(),
-        });
     let (message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
     let (resolution_tx, resolution_rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -1576,7 +1212,6 @@ struct StubCodexThread {
     current_id: AtomicUsize,
     active_prompt_id: std::sync::Mutex<Option<String>>,
     ops: std::sync::Mutex<Vec<Op>>,
-    skills_entries: std::sync::Mutex<Vec<SkillsListEntry>>,
     op_tx: mpsc::UnboundedSender<Event>,
     op_rx: Mutex<mpsc::UnboundedReceiver<Event>>,
 }
@@ -1588,7 +1223,6 @@ impl StubCodexThread {
             current_id: AtomicUsize::new(0),
             active_prompt_id: std::sync::Mutex::default(),
             ops: std::sync::Mutex::default(),
-            skills_entries: std::sync::Mutex::default(),
             op_tx,
             op_rx: Mutex::new(op_rx),
         }
@@ -1642,6 +1276,7 @@ impl CodexThreadImpl for StubCodexThread {
                             }],
                             source: Default::default(),
                             interaction_input: None,
+                            started_at_ms: 0,
                         }));
                         send(EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
                             call_id: "call-b".into(),
@@ -1654,6 +1289,7 @@ impl CodexThreadImpl for StubCodexThread {
                             }],
                             source: Default::default(),
                             interaction_input: None,
+                            started_at_ms: 0,
                         }));
                         send(EventMsg::ExecCommandEnd(ExecCommandEndEvent {
                             call_id: "call-a".into(),
@@ -1671,6 +1307,7 @@ impl CodexThreadImpl for StubCodexThread {
                             duration: std::time::Duration::from_millis(10),
                             formatted_output: "a\n".into(),
                             status: ExecCommandStatus::Completed,
+                            completed_at_ms: 0,
                         }));
                         send(EventMsg::ExecCommandEnd(ExecCommandEndEvent {
                             call_id: "call-b".into(),
@@ -1688,6 +1325,7 @@ impl CodexThreadImpl for StubCodexThread {
                             duration: std::time::Duration::from_millis(10),
                             formatted_output: "b\n".into(),
                             status: ExecCommandStatus::Completed,
+                            completed_at_ms: 0,
                         }));
                         send(EventMsg::TurnComplete(TurnCompleteEvent {
                             last_agent_message: None,
@@ -1778,6 +1416,7 @@ impl CodexThreadImpl for StubCodexThread {
                                         id: "plan-item".to_string(),
                                         text: "- Step 1\n- Step 2\n".to_string(),
                                     }),
+                                    completed_at_ms: 0,
                                 }),
                             })
                             .unwrap();
@@ -1833,11 +1472,13 @@ impl CodexThreadImpl for StubCodexThread {
                             thread_id,
                             turn_id: turn_id.clone(),
                             item: TurnItem::ContextCompaction(compact_item.clone()),
+                            started_at_ms: 0,
                         }));
                         send(EventMsg::ItemCompleted(ItemCompletedEvent {
                             thread_id,
                             turn_id: turn_id.clone(),
                             item: TurnItem::ContextCompaction(compact_item),
+                            completed_at_ms: 0,
                         }));
                         send(EventMsg::PlanUpdate(UpdatePlanArgs {
                             explanation: None,
@@ -1887,6 +1528,7 @@ impl CodexThreadImpl for StubCodexThread {
                                 prompt: "Inspect the parser module".to_string(),
                                 model: "gpt-test".to_string(),
                                 reasoning_effort: ReasoningEffort::Medium,
+                                started_at_ms: 0,
                             },
                         ));
                         send(EventMsg::CollabAgentSpawnEnd(CollabAgentSpawnEndEvent {
@@ -1899,6 +1541,7 @@ impl CodexThreadImpl for StubCodexThread {
                             model: "gpt-test".to_string(),
                             reasoning_effort: ReasoningEffort::Medium,
                             status: AgentStatus::Running,
+                            completed_at_ms: 0,
                         }));
                         send(EventMsg::CollabAgentInteractionBegin(
                             CollabAgentInteractionBeginEvent {
@@ -1906,6 +1549,7 @@ impl CodexThreadImpl for StubCodexThread {
                                 sender_thread_id: sender_thread_id.clone(),
                                 receiver_thread_id: receiver_thread_id.clone(),
                                 prompt: "Check the failing path".to_string(),
+                                started_at_ms: 0,
                             },
                         ));
                         send(EventMsg::CollabAgentInteractionEnd(
@@ -1917,6 +1561,7 @@ impl CodexThreadImpl for StubCodexThread {
                                 receiver_agent_role: Some("explorer".to_string()),
                                 prompt: "Check the failing path".to_string(),
                                 status: AgentStatus::Completed(Some("done".to_string())),
+                                completed_at_ms: 0,
                             },
                         ));
                         send(EventMsg::CollabWaitingBegin(CollabWaitingBeginEvent {
@@ -1931,6 +1576,7 @@ impl CodexThreadImpl for StubCodexThread {
                                 agent_role: Some("explorer".to_string()),
                             }],
                             call_id: "wait-a".to_string(),
+                            started_at_ms: 0,
                         }));
                         send(EventMsg::CollabWaitingEnd(CollabWaitingEndEvent {
                             sender_thread_id: sender_thread_id.clone(),
@@ -1945,6 +1591,7 @@ impl CodexThreadImpl for StubCodexThread {
                                 failed_thread_id.clone(),
                                 AgentStatus::Errored("boom".to_string()),
                             )]),
+                            completed_at_ms: 0,
                         }));
                         send(EventMsg::CollabResumeBegin(CollabResumeBeginEvent {
                             call_id: "resume-a".to_string(),
@@ -1952,6 +1599,7 @@ impl CodexThreadImpl for StubCodexThread {
                             receiver_thread_id: receiver_thread_id.clone(),
                             receiver_agent_nickname: Some("atlas".to_string()),
                             receiver_agent_role: Some("explorer".to_string()),
+                            started_at_ms: 0,
                         }));
                         send(EventMsg::CollabResumeEnd(CollabResumeEndEvent {
                             call_id: "resume-a".to_string(),
@@ -1960,11 +1608,13 @@ impl CodexThreadImpl for StubCodexThread {
                             receiver_agent_nickname: Some("atlas".to_string()),
                             receiver_agent_role: Some("explorer".to_string()),
                             status: AgentStatus::Running,
+                            completed_at_ms: 0,
                         }));
                         send(EventMsg::CollabCloseBegin(CollabCloseBeginEvent {
                             call_id: "close-a".to_string(),
                             sender_thread_id: sender_thread_id.clone(),
                             receiver_thread_id: receiver_thread_id.clone(),
+                            started_at_ms: 0,
                         }));
                         send(EventMsg::CollabCloseEnd(CollabCloseEndEvent {
                             call_id: "close-a".to_string(),
@@ -1973,6 +1623,7 @@ impl CodexThreadImpl for StubCodexThread {
                             receiver_agent_nickname: Some("atlas".to_string()),
                             receiver_agent_role: Some("explorer".to_string()),
                             status: AgentStatus::Shutdown,
+                            completed_at_ms: 0,
                         }));
                         send(EventMsg::TurnComplete(TurnCompleteEvent {
                             last_agent_message: None,
@@ -2068,7 +1719,7 @@ impl CodexThreadImpl for StubCodexThread {
                             result: "image saved".to_string(),
                             saved_path: None,
                         }));
-                        send(EventMsg::BackgroundEvent(BackgroundEventEvent {
+                        send(EventMsg::Warning(WarningEvent {
                             message: "Background task completed".to_string(),
                         }));
                         send(EventMsg::DeprecationNotice(DeprecationNoticeEvent {
@@ -2141,6 +1792,7 @@ impl CodexThreadImpl for StubCodexThread {
                             duration: std::time::Duration::from_millis(10),
                             formatted_output: "hello".into(),
                             status: ExecCommandStatus::Completed,
+                            completed_at_ms: 0,
                         }));
                         send(EventMsg::TurnComplete(TurnCompleteEvent {
                             last_agent_message: None,
@@ -2296,41 +1948,6 @@ impl CodexThreadImpl for StubCodexThread {
                         })
                         .unwrap();
                 }
-                Op::Undo => {
-                    self.op_tx
-                        .send(Event {
-                            id: id.to_string(),
-                            msg: EventMsg::UndoStarted(
-                                codex_protocol::protocol::UndoStartedEvent {
-                                    message: Some("Undo in progress...".to_string()),
-                                },
-                            ),
-                        })
-                        .unwrap();
-                    self.op_tx
-                        .send(Event {
-                            id: id.to_string(),
-                            msg: EventMsg::UndoCompleted(
-                                codex_protocol::protocol::UndoCompletedEvent {
-                                    success: true,
-                                    message: Some("Undo completed.".to_string()),
-                                },
-                            ),
-                        })
-                        .unwrap();
-                    self.op_tx
-                        .send(Event {
-                            id: id.to_string(),
-                            msg: EventMsg::TurnComplete(TurnCompleteEvent {
-                                last_agent_message: None,
-                                turn_id: id.to_string(),
-                                completed_at: None,
-                                duration_ms: None,
-                                time_to_first_token_ms: None,
-                            }),
-                        })
-                        .unwrap();
-                }
                 Op::Review { review_request } => {
                     self.op_tx
                         .send(Event {
@@ -2367,16 +1984,6 @@ impl CodexThreadImpl for StubCodexThread {
                         })
                         .unwrap();
                 }
-                Op::ListSkills { .. } => {
-                    self.op_tx
-                        .send(Event {
-                            id: id.to_string(),
-                            msg: EventMsg::ListSkillsResponse(ListSkillsResponseEvent {
-                                skills: self.skills_entries.lock().unwrap().clone(),
-                            }),
-                        })
-                        .unwrap();
-                }
                 Op::ExecApproval { .. }
                 | Op::ResolveElicitation { .. }
                 | Op::RequestPermissionsResponse { .. }
@@ -2384,17 +1991,6 @@ impl CodexThreadImpl for StubCodexThread {
                 | Op::UserInputAnswer { .. }
                 | Op::OverrideTurnContext { .. }
                 | Op::Interrupt => {}
-                Op::SetThreadName { name } => {
-                    self.op_tx
-                        .send(Event {
-                            id: id.to_string(),
-                            msg: EventMsg::ThreadNameUpdated(ThreadNameUpdatedEvent {
-                                thread_id: ThreadId::new(),
-                                thread_name: Some(name),
-                            }),
-                        })
-                        .unwrap();
-                }
                 Op::Shutdown => {
                     if let Some(active_prompt_id) = self.active_prompt_id.lock().unwrap().take() {
                         self.op_tx

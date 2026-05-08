@@ -581,8 +581,8 @@ impl CodexAgent {
             thread,
             session_configured: _,
         } = Box::pin(self.thread_manager.start_thread(config.clone()))
-        .await
-        .map_err(|_e| Error::internal_error())?;
+            .await
+            .map_err(|_e| Error::internal_error())?;
 
         let session_id = Self::session_id_from_thread_id(thread_id);
         // Record the session root for filesystem sandboxing.

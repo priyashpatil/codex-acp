@@ -67,9 +67,9 @@ use codex_protocol::{
         GuardianAssessmentEvent, GuardianAssessmentStatus, HookCompletedEvent, HookStartedEvent,
         ImageGenerationBeginEvent, ImageGenerationEndEvent, ItemCompletedEvent, ItemStartedEvent,
         McpInvocation, McpStartupCompleteEvent, McpStartupStatus, McpStartupUpdateEvent,
-        McpToolCallBeginEvent, McpToolCallEndEvent, ModelRerouteEvent,
-        ModelVerification, ModelVerificationEvent, NetworkApprovalContext, NetworkPolicyRuleAction,
-        Op, PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus, PatchApplyUpdatedEvent,
+        McpToolCallBeginEvent, McpToolCallEndEvent, ModelRerouteEvent, ModelVerification,
+        ModelVerificationEvent, NetworkApprovalContext, NetworkPolicyRuleAction, Op,
+        PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus, PatchApplyUpdatedEvent,
         PlanDeltaEvent, RawResponseItemEvent, ReasoningContentDeltaEvent,
         ReasoningRawContentDeltaEvent, ReviewDecision, ReviewOutputEvent, ReviewRequest,
         ReviewTarget, RolloutItem, SkillMetadata, StreamErrorEvent, TerminalInteractionEvent,
@@ -1388,7 +1388,9 @@ impl PromptState {
                 turn_id,
                 started_at: _,
             }) => {
-                info!("Task started with context window of {turn_id} {model_context_window:?} {collaboration_mode_kind:?}");
+                info!(
+                    "Task started with context window of {turn_id} {model_context_window:?} {collaboration_mode_kind:?}"
+                );
                 self.turn_complete = false;
                 self.turn_collaboration_mode_kind = collaboration_mode_kind;
                 self.saw_plan_output = false;
@@ -1397,19 +1399,20 @@ impl PromptState {
             }
             EventMsg::TokenCount(TokenCountEvent { info, rate_limits }) => {
                 if let Some(info) = info
-                    && let Some(size) = info.model_context_window {
-                        self.accumulated_usage.add(&info.last_token_usage);
-                        let used = info.total_token_usage.tokens_in_context_window().max(0) as u64;
-                        let mut update = UsageUpdate::new(used, size as u64);
-                        if let Some(rate_limits) = rate_limits
-                            && let Some(credits) = rate_limits.credits
-                            && let Some(balance) = credits.balance
-                            && let Ok(amount) = balance.parse::<f64>()
-                        {
-                            update = update.cost(Cost::new(amount, "USD"));
-                        }
-                        client.send_notification(SessionUpdate::UsageUpdate(update));
+                    && let Some(size) = info.model_context_window
+                {
+                    self.accumulated_usage.add(&info.last_token_usage);
+                    let used = info.total_token_usage.tokens_in_context_window().max(0) as u64;
+                    let mut update = UsageUpdate::new(used, size as u64);
+                    if let Some(rate_limits) = rate_limits
+                        && let Some(credits) = rate_limits.credits
+                        && let Some(balance) = credits.balance
+                        && let Ok(amount) = balance.parse::<f64>()
+                    {
+                        update = update.cost(Cost::new(amount, "USD"));
                     }
+                    client.send_notification(SessionUpdate::UsageUpdate(update));
+                }
             }
             EventMsg::ItemStarted(ItemStartedEvent {
                 thread_id,
@@ -1417,7 +1420,9 @@ impl PromptState {
                 item,
                 ..
             }) => {
-                info!("Item started with thread_id: {thread_id}, turn_id: {turn_id}, item: {item:?}");
+                info!(
+                    "Item started with thread_id: {thread_id}, turn_id: {turn_id}, item: {item:?}"
+                );
                 if let TurnItem::ContextCompaction(item) = item {
                     self.start_context_compaction(client, &item.id);
                 }
@@ -1436,7 +1441,9 @@ impl PromptState {
                 item_id,
                 delta,
             }) => {
-                info!("Agent message content delta received: thread_id: {thread_id}, turn_id: {turn_id}, item_id: {item_id}, delta: {delta:?}");
+                info!(
+                    "Agent message content delta received: thread_id: {thread_id}, turn_id: {turn_id}, item_id: {item_id}, delta: {delta:?}"
+                );
                 self.seen_message_deltas = true;
                 client.send_agent_text(delta);
             }
@@ -1454,7 +1461,9 @@ impl PromptState {
                 delta,
                 content_index: index,
             }) => {
-                info!("Agent reasoning content delta received: thread_id: {thread_id}, turn_id: {turn_id}, item_id: {item_id}, index: {index}, delta: {delta:?}");
+                info!(
+                    "Agent reasoning content delta received: thread_id: {thread_id}, turn_id: {turn_id}, item_id: {item_id}, index: {index}, delta: {delta:?}"
+                );
                 self.seen_reasoning_deltas = true;
                 client.send_agent_thought(delta);
             }
@@ -1462,12 +1471,18 @@ impl PromptState {
                 item_id,
                 summary_index,
             }) => {
-                info!("Agent reasoning section break received:  item_id: {item_id}, index: {summary_index}");
+                info!(
+                    "Agent reasoning section break received:  item_id: {item_id}, index: {summary_index}"
+                );
                 // Make sure the section heading actually get spacing
                 self.seen_reasoning_deltas = true;
                 client.send_agent_thought("\n\n");
             }
-            EventMsg::AgentMessage(AgentMessageEvent { message , phase: _, memory_citation: _ }) => {
+            EventMsg::AgentMessage(AgentMessageEvent {
+                message,
+                phase: _,
+                memory_citation: _,
+            }) => {
                 info!("Agent message (non-delta) received: {message:?}");
                 // We didn't receive this message via streaming
                 if !std::mem::take(&mut self.seen_message_deltas) {
@@ -1486,7 +1501,10 @@ impl PromptState {
                 client.send_agent_thought(text);
             }
             EventMsg::SessionConfigured(event) => {
-                info!("Session configured with thread name: {:?}", event.thread_name);
+                info!(
+                    "Session configured with thread name: {:?}",
+                    event.thread_name
+                );
                 send_session_title_update(client, event.thread_name);
             }
             EventMsg::ThreadGoalUpdated(event) => {
@@ -1566,7 +1584,9 @@ impl PromptState {
                 arguments,
                 ..
             }) => {
-                info!("Dynamic tool call request: call_id={call_id}, turn_id={turn_id}, namespace={namespace:?}, tool={tool}");
+                info!(
+                    "Dynamic tool call request: call_id={call_id}, turn_id={turn_id}, namespace={namespace:?}, tool={tool}"
+                );
                 self.start_dynamic_tool_call(client, call_id, tool, arguments);
             }
             EventMsg::DynamicToolCallResponse(event) => {
@@ -1640,7 +1660,7 @@ impl PromptState {
             EventMsg::McpToolCallBegin(McpToolCallBeginEvent {
                 call_id,
                 invocation,
-                mcp_app_resource_uri: _
+                mcp_app_resource_uri: _,
             }) => {
                 info!(
                     "MCP tool call begin: call_id={call_id}, invocation={} {}",
@@ -1752,23 +1772,28 @@ impl PromptState {
                 item,
                 ..
             }) => {
-                info!("Item completed: thread_id={}, turn_id={}, item={:?}", thread_id, turn_id, item);
+                info!(
+                    "Item completed: thread_id={}, turn_id={}, item={:?}",
+                    thread_id, turn_id, item
+                );
                 match item {
                     TurnItem::Plan(plan_item) => {
                         self.saw_plan_output = true;
                         self.plan_output_text = Some(plan_item.text);
                     }
                     TurnItem::ContextCompaction(item) => {
-                        self.settle_context_compaction(
-                            client,
-                            &item.id,
-                            ToolCallStatus::Completed,
-                        );
+                        self.settle_context_compaction(client, &item.id, ToolCallStatus::Completed);
                     }
                     _ => {}
                 }
             }
-            EventMsg::TurnComplete(TurnCompleteEvent { last_agent_message, turn_id, completed_at: _, duration_ms: _, time_to_first_token_ms: _, }) => {
+            EventMsg::TurnComplete(TurnCompleteEvent {
+                last_agent_message,
+                turn_id,
+                completed_at: _,
+                duration_ms: _,
+                time_to_first_token_ms: _,
+            }) => {
                 info!(
                     "Task {turn_id} completed successfully after {} events. Last agent message: {last_agent_message:?}",
                     self.event_count
@@ -1813,7 +1838,12 @@ impl PromptState {
                         .ok();
                 }
             }
-            EventMsg::TurnAborted(TurnAbortedEvent { reason, turn_id, completed_at: _, duration_ms: _ }) => {
+            EventMsg::TurnAborted(TurnAbortedEvent {
+                reason,
+                turn_id,
+                completed_at: _,
+                duration_ms: _,
+            }) => {
                 info!("Turn {turn_id:?} aborted: {reason:?}");
                 self.settle_all_context_compactions(client, ToolCallStatus::Failed);
                 self.settle_all_patch_applies(client, ToolCallStatus::Failed);
@@ -1836,14 +1866,18 @@ impl PromptState {
             EventMsg::ViewImageToolCall(ViewImageToolCallEvent { call_id, path }) => {
                 info!("ViewImageToolCallEvent received");
                 let display_path = path.display().to_string();
-                client.send_notification(
-                    SessionUpdate::ToolCall(
-                        ToolCall::new(call_id, format!("View Image {display_path}"))
-                            .kind(ToolKind::Read).status(ToolCallStatus::Completed)
-                            .content(vec![ToolCallContent::Content(Content::new(ContentBlock::ResourceLink(ResourceLink::new(display_path.clone(), display_path.clone())
-                        )
-                    )
-                )]).locations(vec![ToolCallLocation::new(path)])));
+                client.send_notification(SessionUpdate::ToolCall(
+                    ToolCall::new(call_id, format!("View Image {display_path}"))
+                        .kind(ToolKind::Read)
+                        .status(ToolCallStatus::Completed)
+                        .content(vec![ToolCallContent::Content(Content::new(
+                            ContentBlock::ResourceLink(ResourceLink::new(
+                                display_path.clone(),
+                                display_path.clone(),
+                            )),
+                        ))])
+                        .locations(vec![ToolCallLocation::new(path)]),
+                ));
             }
             EventMsg::EnteredReviewMode(review_request) => {
                 info!("Review begin: request={review_request:?}");
@@ -1888,14 +1922,21 @@ impl PromptState {
                 }
             }
             EventMsg::ElicitationRequest(event) => {
-                info!("Elicitation request: server={}, id={:?}", event.server_name, event.id);
+                info!(
+                    "Elicitation request: server={}, id={:?}",
+                    event.server_name, event.id
+                );
                 if let Err(err) = self.mcp_elicitation(client, event).await
                     && let Some(response_tx) = self.response_tx.take()
                 {
                     drop(response_tx.send(Err(err)));
                 }
             }
-            EventMsg::ModelReroute(ModelRerouteEvent { from_model, to_model, reason }) => {
+            EventMsg::ModelReroute(ModelRerouteEvent {
+                from_model,
+                to_model,
+                reason,
+            }) => {
                 info!("Model reroute: from={from_model}, to={to_model}, reason={reason:?}");
             }
             EventMsg::ModelVerification(event) => {
@@ -1961,7 +2002,7 @@ impl PromptState {
             | EventMsg::RealtimeConversationStarted(..)
             | EventMsg::RealtimeConversationRealtime(..)
             | EventMsg::RealtimeConversationClosed(..)
-            | EventMsg::RealtimeConversationSdp(..)=> {}
+            | EventMsg::RealtimeConversationSdp(..) => {}
             e @ EventMsg::RealtimeConversationListVoicesResponse(..) => {
                 warn!("Unexpected event: {:?}", e);
             }
