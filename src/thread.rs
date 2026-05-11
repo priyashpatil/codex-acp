@@ -143,6 +143,8 @@ use tools::{
     web_search_action_to_title_and_id,
 };
 
+use crate::plan_instructions::with_acp_task_plan_instructions;
+
 const INIT_COMMAND_PROMPT: &str = include_str!("./prompt_for_init_command.md");
 
 /// Trait for abstracting over the `CodexThread` to make testing easier.
@@ -3938,7 +3940,12 @@ impl<A: Auth> ThreadActor<A> {
             },
         };
 
-        Ok(current_mode.apply_mask(mask))
+        let mut next_mode = current_mode.apply_mask(mask);
+        next_mode.settings.developer_instructions = Some(with_acp_task_plan_instructions(
+            next_mode.settings.developer_instructions,
+        ));
+
+        Ok(next_mode)
     }
 
     fn apply_collaboration_mode(&mut self, next_mode: CollaborationMode) {

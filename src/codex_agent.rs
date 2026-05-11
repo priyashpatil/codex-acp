@@ -36,6 +36,7 @@ use std::{
 use tracing::{debug, info, warn};
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::plan_instructions::with_acp_task_plan_instructions;
 use crate::thread::Thread;
 
 /// The Codex implementation of the ACP Agent.
@@ -343,6 +344,9 @@ impl CodexAgent {
     ) -> Result<Config, Error> {
         let mut config = self.config.clone();
         config.include_apply_patch_tool = true;
+        config.developer_instructions = Some(with_acp_task_plan_instructions(
+            config.developer_instructions,
+        ));
         config.cwd = cwd.try_into().map_err(Error::into_internal_error)?;
         let cwd = config.cwd.clone();
 
